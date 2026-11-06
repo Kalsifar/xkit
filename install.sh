@@ -3,7 +3,7 @@
 #  XKIT installer — установка xkit.sh одной командой
 #
 #  GitHub (рекомендуемый вариант, файлы install.sh + xkit.sh в одном репо):
-#    curl -fsSL https://raw.githubusercontent.com/НИК/xkit/main/install.sh | sudo bash
+#    curl -fsSL https://raw.githubusercontent.com/kalsifar/xkit/main/install.sh | sudo bash
 #
 #  Свой сервер (оба файла в одной папке за nginx):
 #    curl -fsSL https://ВАШ_ДОМЕН/xkit/install.sh | sudo bash
@@ -20,7 +20,8 @@
 #    curl -fsSL https://.../install.sh | sudo bash -s -- -y
 #==============================================================================
 
-
+# Ник репозитория уже вписан (kalsifar) — установка одной строкой работает без правок.
+# Форкнули/переименовали? Замените ник ниже или задайте XKIT_BASE/URL при запуске:
 XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kalsifar/xkit/main}"
 
 set -u
@@ -87,9 +88,9 @@ if [ -n "$SRC" ]; then
 else
   BASE="${URL_ARG:-$XKIT_BASE}"
   if [[ "$BASE" == *YOUR_USERNAME* ]]; then
-    err "install.sh не настроен: замените YOUR_USERNAME на свой ник в install.sh,"
+    err "Источник не настроен: в install.sh стёрт ник репозитория (YOUR_USERNAME),"
     err "либо задайте XKIT_BASE=https://... или передайте URL первым аргументом:"
-    err "  bash install.sh https://raw.githubusercontent.com/НИК/xkit/main/xkit.sh"
+    err "  bash install.sh https://raw.githubusercontent.com/kalsifar/xkit/main/xkit.sh"
     exit 1
   fi
   case "$BASE" in

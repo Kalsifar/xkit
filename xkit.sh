@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v4.8.0 — «кит-меню» для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v4.9.0 — «кит-меню» для nginx + 3X-UI (Ubuntu 24.04+)
 #  Похож на родное меню x-ui: зашёл по SSH — меню само (или наберите `xkit`).
 #
 #  ГЛАВНОЕ:
@@ -177,6 +177,24 @@
 #     дублируется; notify_state_set пишет в subshell (umask не утекает при
 #     сбоях), xui_env_val парсит awk'ом (ключ с метасимволами безопасен)
 #
+#  НОВОЕ В v4.9.0 (замечания с живой установки):
+#   • ВЫБОР АДРЕСА показывает реальный IP: определённый pubip выводится как
+#     пункт 1 («IP этого сервера — 1.2.3.4»), Enter = согласиться, 2 = свой
+#     домен/другой IP. Раньше адрес просили набрать вслепую — реальный IP
+#     на экране не показывался
+#   • certbot >= 5.3 ставится СРАЗУ (шаг 1/7, после apt): в репо Ubuntu 24.04
+#     certbot 2.9 без --ip-address, и раньше это всплывало вопросом посреди
+#     установки и могло её оборвать. Теперь pip/venv-обновление — неинтерактивно
+#     в начале; в issue_cert_le_ip вопрос убран, авто-попытка без вопросов
+#   • ПРОВАЛ выпуска серта больше НЕ выбрасывает из установки: меню
+#     сертификата показывается снова (до 5 попыток; EOF/Ctrl-D = пункт 4,
+#     самоподписанный — работает всегда). Раньше return 1 из issue_cert_le_ip
+#     обрывал one_step_install и выкидывал админа в консоль
+#   • Email для Let's Encrypt спрашивается только для пунктов 1/3 (раньше —
+#     для всех, включая самоподписанный и свои файлы)
+#   • install.sh: ник репозитория вписан сразу (kalsifar) — установка одной
+#     строкой работает без правки install.sh
+#
 #  НОВОЕ В v4.8.0 (правки финального ревью №2 + GitHub-инструкция):
 #   • node_add: EOF (Ctrl-D) на ЛЮБОМ вводе — отмена, а не молчаливое
 #     продолжение с дефолтами 22/root и попыткой коннекта к ноде
@@ -230,7 +248,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="4.8.0"
+XKIT_VERSION="4.9.0"
 # TTY-детект (ревью v4.7.0): при не-терминале (curl|bash, cron, tee, CI) цвета
 # гаснут — в логах не остаётся сырых \033[… кодов. XKIT_NO_COLOR=1 — ручной
 # override; XKIT_NO_ANIM=1 отключает спиннер при живом TTY
@@ -449,6 +467,32 @@ read_host() {
   done
 }
 
+# ревью v4.9.0 (живая установка): адрес сервера раньше просили набрать вслепую —
+# реальный IP на экране не показывался. Теперь определяем pubip и показываем его
+# как пункт 1 (Enter = согласиться); 2 — свой домен/другой IP вручную.
+# Результат — в глобальной CHOSEN_HOST (stdout занят меню, $() не использовать)
+choose_host() {
+  local prompt="${1:-Адрес этого сервера}" myip a
+  myip="$(pubip)"
+  if [ -z "$myip" ]; then
+    warn "Публичный IP не определился (api.ipify.org недоступен?) — введите адрес вручную"
+    CHOSEN_HOST="$(read_host "$prompt (домен/IP) -> ")"
+    return 0
+  fi
+  echo ""
+  echo -e "${YELLOW}${prompt}:${NC}"
+  echo "1) IP этого сервера — $myip (определён автоматически)"
+  echo "2) Свой домен или другой IP (ввести вручную)"
+  while true; do
+    read -r -p "Ваш выбор [1]: " a || { echo; a="1"; }
+    case "${a:-1}" in
+      1) CHOSEN_HOST="$myip"; return 0 ;;
+      2) CHOSEN_HOST="$(read_host "Домен или IP -> ")"; return 0 ;;
+      *) err "Пункт 1 или 2" ;;
+    esac
+  done
+}
+
 read_port() {
   local prompt="$1" v
   while true; do
@@ -646,13 +690,14 @@ issue_cert_le_domain() {
 issue_cert_le_ip() {
   local ip="$1" email="$2" rc=0 extra=()
   if ! certbot_supports_ip; then
-    warn "certbot $(certbot_version) не умеет IP-сертификаты (нужно >= ${CERTBOT_MIN_IP})"
-    read -r -p "Обновить certbot автоматически через pip/venv? [y/N]: " a
-    if [[ "$a" =~ ^[Yy] ]]; then
-      certbot_upgrade || { err "Обновление не удалось — используйте самоподписанный (пункт 4)"; return 1; }
+    # ревью v4.9.0: вопрос убран (застопорил живую установку) — авто-попытка;
+    # провал возвращает 1, но choose_certificate теперь показывает меню снова,
+    # а не выкидывает из установки
+    warn "certbot $(certbot_version) не умеет IP-сертификаты (нужно >= ${CERTBOT_MIN_IP}) — обновляю..."
+    if certbot_upgrade; then
       ok "certbot обновлён: $(certbot_version)"
     else
-      warn "Обновите certbot или используйте самоподписанный серт (пункт 4)"
+      err "Обновить certbot не удалось (PyPI недоступен?) — выберите самоподписанный серт (пункт 4)"
       return 1
     fi
   fi
@@ -702,40 +747,70 @@ install_cert_files() {
   return 0
 }
 
-# выбор сертификата (используется установкой и пунктом «перевыпустить»)
+# выбор сертификата (используется установкой, сокрытием панели и пунктом «перевыпустить»)
 # результаты: CERT_MODE, FINAL_CRT, FINAL_KEY, LE_EMAIL
+# ревью v4.9.0: провал выпуска серта больше НЕ убивает установку — меню показывается
+# снова (лимит 5 попыток, чтобы EOF в цикле не крутился вечно; EOF/Ctrl-D = пункт 4 —
+# самоподписанный работает всегда). Раньше return 1 из issue_cert_le_ip обрывал
+# one_step_install и выкидывал админа в консоль. Email спрашивается только для LE (1/3)
 choose_certificate() {
-  local host="$1" kind="$2"
-  echo ""
-  echo -e "${YELLOW}Откуда берём SSL-сертификат?${NC}"
-  echo "1) Let's Encrypt — для ДОМЕНА (90 дней, авто-продление)"
-  echo "2) Свои файлы в /root/cert/$host/ (fullchain.pem + privkey.pem)"
-  echo "3) Let's Encrypt — для IP (shortlived, 6 дней, авто-продление)"
-  echo "4) Самоподписанный — домен или IP (10 лет, allowInsecure=true)"
-  read -r -p "Ваш выбор: " CERT_MODE
-  case "$CERT_MODE" in 1|2|3|4) ;; *) die "Нет такого пункта" ;; esac
-  read -r -p "Email для Let's Encrypt (Enter — пропустить): " LE_EMAIL
-  if [ -n "$LE_EMAIL" ] && ! is_email "$LE_EMAIL"; then
-    warn "Email выглядит некорректно — продолжаю без него"; LE_EMAIL=""
-  fi
-  FINAL_CRT=""; FINAL_KEY=""
-  case "$CERT_MODE" in
-    1) [ "$kind" = "domain" ] || die "LE-сертификаты на IP не выдаются — выберите пункт 3 или 4"
-       issue_cert_le_domain "$host" "$LE_EMAIL" || return 1
-       FINAL_CRT="/etc/letsencrypt/live/$host/fullchain.pem"
-       FINAL_KEY="/etc/letsencrypt/live/$host/privkey.pem" ;;
-    2) install_cert_files "$host" || return 1
-       FINAL_CRT="/etc/nginx/ssl/$host/fullchain.pem"
-       FINAL_KEY="/etc/nginx/ssl/$host/privkey.pem" ;;
-    3) [ "$kind" = "ip" ] || die "Пункт 3 — для IP. Для домена выберите пункт 1"
-       issue_cert_le_ip "$host" "$LE_EMAIL" || return 1
-       FINAL_CRT="/etc/letsencrypt/live/$host/fullchain.pem"
-       FINAL_KEY="/etc/letsencrypt/live/$host/privkey.pem" ;;
-    4) issue_cert_selfsigned "$host" "$kind" || return 1
-       FINAL_CRT="/etc/nginx/ssl/$host/fullchain.pem"
-       FINAL_KEY="/etc/nginx/ssl/$host/privkey.pem" ;;
-  esac
-  return 0
+  local host="$1" kind="$2" try=0
+  FINAL_CRT=""; FINAL_KEY=""; LE_EMAIL=""
+  while :; do
+    try=$((try+1))
+    if [ "$try" -gt 5 ]; then
+      err "Сертификат не получен за 5 попыток — установка прервана на этом шаге"
+      return 1
+    fi
+    echo ""
+    echo -e "${YELLOW}Откуда берём SSL-сертификат?${NC}"
+    echo "1) Let's Encrypt — для ДОМЕНА (90 дней, авто-продление)"
+    echo "2) Свои файлы в /root/cert/$host/ (fullchain.pem + privkey.pem)"
+    if certbot_supports_ip; then
+      echo "3) Let's Encrypt — для IP (shortlived, 6 дней, авто-продление)"
+    else
+      echo "3) Let's Encrypt — для IP (сначала авто-обновление certbot; если не выйдет — пункт 4)"
+    fi
+    echo "4) Самоподписанный — домен или IP (10 лет, allowInsecure=true)"
+    if ! read -r -p "Ваш выбор (1-4): " CERT_MODE; then
+      echo
+      warn "Ввод прерван (EOF) — беру самоподписанный (пункт 4)"
+      CERT_MODE="4"
+    fi
+    case "$CERT_MODE" in
+      1|2|3|4) ;;
+      *) warn "Нет такого пункта — выберите 1-4"; continue ;;
+    esac
+    LE_EMAIL=""
+    case "$CERT_MODE" in
+      1|3)
+        read -r -p "Email для Let's Encrypt (Enter — пропустить): " LE_EMAIL || { echo; LE_EMAIL=""; }
+        if [ -n "$LE_EMAIL" ] && ! is_email "$LE_EMAIL"; then
+          warn "Email выглядит некорректно — продолжаю без него"; LE_EMAIL=""
+        fi ;;
+    esac
+    case "$CERT_MODE" in
+      1) if [ "$kind" != "domain" ]; then
+           err "LE-сертификаты на IP не выдаются — выберите пункт 3 или 4"; continue
+         fi
+         issue_cert_le_domain "$host" "$LE_EMAIL" || { err "Не вышло — исправьте проблему или выберите другой вариант"; continue; }
+         FINAL_CRT="/etc/letsencrypt/live/$host/fullchain.pem"
+         FINAL_KEY="/etc/letsencrypt/live/$host/privkey.pem" ;;
+      2) install_cert_files "$host" || { err "Не вышло — положите fullchain.pem + privkey.pem в /root/cert/$host/ и попробуйте снова"; continue; }
+         FINAL_CRT="/etc/nginx/ssl/$host/fullchain.pem"
+         FINAL_KEY="/etc/nginx/ssl/$host/privkey.pem" ;;
+      3) if [ "$kind" != "ip" ]; then
+           err "Пункт 3 — для IP. Для домена выберите пункт 1"; continue
+         fi
+         issue_cert_le_ip "$host" "$LE_EMAIL" || { err "Не вышло — выберите другой вариант"; continue; }
+         FINAL_CRT="/etc/letsencrypt/live/$host/fullchain.pem"
+         FINAL_KEY="/etc/letsencrypt/live/$host/privkey.pem" ;;
+      4) issue_cert_selfsigned "$host" "$kind" || { err "Не вышло — попробуйте снова"; continue; }
+         FINAL_CRT="/etc/nginx/ssl/$host/fullchain.pem"
+         FINAL_KEY="/etc/nginx/ssl/$host/privkey.pem" ;;
+    esac
+    return 0
+  done
 }
 
 #=========================== ГЕНЕРАЦИЯ LOCATION ===============================
@@ -2425,14 +2500,30 @@ one_step_install() {
   with_spinner "apt-get update..." apt-get update -qq || warn "apt-get update вернул ошибку — продолжаю"
   with_spinner "Установка пакетов..." env DEBIAN_FRONTEND=noninteractive \
     apt-get install -y -qq nginx curl certbot openssl jq sqlite3 ufw cron python3 \
+    python3-venv python3-pip \
     || die "Не удалось установить пакеты — подробности в $XKIT_LOG"
+  # ревью v4.9.0 (живая установка): в репо Ubuntu 24.04 certbot 2.9 без --ip-address.
+  # Раньше это всплывало вопросом посреди установки и могло её оборвать — теперь
+  # обновляем СРАЗУ (pip/venv), до вопросов про адрес/серт; не вышло — не фатально,
+  # issue_cert_le_ip повторит попытку и меню серта предложит пункт 4
+  if ! certbot_supports_ip; then
+    log "certbot $(certbot_version) старый — обновляю до актуального (нужен >= ${CERTBOT_MIN_IP} для IP-сертификатов)..."
+    if with_spinner "Обновление certbot (pip/venv, 1-2 мин)..." certbot_upgrade; then
+      ok "certbot обновлён: $(certbot_version)"
+    else
+      warn "certbot обновить не удалось — IP-сертификаты будут недоступны (возьмите самоподписанный)"
+    fi
+  fi
 
   step "Домен/IP и SSL-сертификат"
   if [ -n "${XKIT_HOST:-}" ]; then
     read -r -p "Использовать прежний адрес ${XKIT_HOST}? [Y/n]: " a
     if [[ "$a" =~ ^[Nn] ]]; then XKIT_HOST=""; fi
   fi
-  [ -n "${XKIT_HOST:-}" ] || XKIT_HOST="$(read_host "Домен ИЛИ IP ЭТОГО сервера (например vpn.example.com или 203.0.113.10) -> ")"
+  if [ -z "${XKIT_HOST:-}" ]; then
+    choose_host "Адрес этого сервера (для сертификата и ссылок)"
+    XKIT_HOST="$CHOSEN_HOST"
+  fi
   [ -n "$XKIT_HOST" ] || die "Домен/IP обязателен"
   HOST_KIND="$(host_kind "$XKIT_HOST")"
   [ "$HOST_KIND" != "bad" ] || die "Адрес не распознан"
@@ -2537,7 +2628,8 @@ hide_existing_panel() {
   ok "Найдена панель: 127.0.0.1:${PANEL_PORT}${PANEL_WBP}"
 
   echo ""
-  XKIT_HOST="$(read_host "Домен ИЛИ IP ЭТОГО сервера (для nginx) -> ")"
+  choose_host "Адрес этого сервера (для nginx)"
+  XKIT_HOST="$CHOSEN_HOST"
   [ -n "$XKIT_HOST" ] || die "Домен/IP обязателен"
   HOST_KIND="$(host_kind "$XKIT_HOST")"
   choose_certificate "$XKIT_HOST" "$HOST_KIND" || return 1
