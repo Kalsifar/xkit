@@ -20,8 +20,8 @@
 #    curl -fsSL https://.../install.sh | sudo bash -s -- -y
 #==============================================================================
 
-# ⚠️ ЗАМЕНИТЕ НИК на свой (или задайте XKIT_BASE/URL при запуске):
-XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/YOUR_USERNAME/xkit/main}"
+
+XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kalsifar/xkit/main}"
 
 set -u
 # TTY-детект (ревью v4.7): при не-терминале (curl|bash | tee log) цвета гаснут —
