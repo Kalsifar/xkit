@@ -127,6 +127,44 @@ fi
 bash -n "$WORK/xkit.sh" || { err "Синтаксическая ошибка в xkit.sh — установка отменена"; exit 1; }
 chmod 700 "$WORK/xkit.sh"
 
+# --- модуль меню (v5.0.0): UI-слой xkit живёт в отдельном файле xkit_menu.sh.
+# Кладём его в WORK рядом с xkit.sh — one_step_install сам перенесёт его
+# в /usr/local/lib/xkit. Если файл не доедет — xkit при первом запуске
+# докачает меню сам (XKIT_REPO_URL + сверка SHA-256)
+MENU_OK=1
+SRCDIR=""
+[ -n "$SRC" ] && SRCDIR="$(cd "$(dirname -- "$SRC")" 2>/dev/null && pwd)"
+if [ -n "$SRCDIR" ] && [ -f "$SRCDIR/xkit_menu.sh" ]; then
+  cp -f "$SRCDIR/xkit_menu.sh" "$WORK/xkit_menu.sh" || exit 1
+  log "Модуль меню найден рядом: $SRCDIR/xkit_menu.sh"
+else
+  MENUURL="${REPO}/xkit_menu.sh"   # REPO уже без /xkit.sh на конце
+  log "Скачиваю: $MENUURL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$MENUURL" -o "$WORK/xkit_menu.sh" || MENU_OK=0
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$WORK/xkit_menu.sh" "$MENUURL" || MENU_OK=0
+  else
+    err "Нужен curl или wget"; exit 1
+  fi
+  # сумма меню — строка 2 пломбы (формат sha256sum, 2 строки, v5.0.0)
+  if [ "$MENU_OK" = "1" ] && [ -s "$WORK/xkit_menu.sh" ] && [ -s "$WORK/xkit.sh.sha256" ]; then
+    WANTM="$(awk '$2=="xkit_menu.sh"{print $1; exit}' "$WORK/xkit.sh.sha256")"
+    GOTM="$(sha256sum "$WORK/xkit_menu.sh" | awk '{print $1}')"
+    if [ -n "$WANTM" ] && [ "$WANTM" != "$GOTM" ]; then
+      err "SHA-256 xkit_menu.sh НЕ совпал — файл битый или изменён. Установка отменена."
+      exit 1
+    fi
+    [ -n "$WANTM" ] && log "SHA-256 xkit_menu.sh проверен: $GOTM"
+  fi
+fi
+if [ -s "$WORK/xkit_menu.sh" ]; then
+  bash -n "$WORK/xkit_menu.sh" || { err "Синтаксическая ошибка в xkit_menu.sh — установка отменена"; exit 1; }
+  chmod 700 "$WORK/xkit_menu.sh"
+else
+  warn "xkit_menu.sh не скачался — xkit докачает меню при первом запуске (xkit update)"
+fi
+
 # --- команды, которым root не нужен (xkit сам проверит root там, где надо)
 case "${XKIT_ARGS[0]}" in
   help|status|health) NEED_ROOT=0 ;;

@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v4.9.0 — «кит-меню» для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v4.9.1 — «кит-меню» для nginx + 3X-UI (Ubuntu 24.04+)
 #  Похож на родное меню x-ui: зашёл по SSH — меню само (или наберите `xkit`).
 #
 #  ГЛАВНОЕ:
@@ -177,6 +177,49 @@
 #     дублируется; notify_state_set пишет в subshell (umask не утекает при
 #     сбоях), xui_env_val парсит awk'ом (ключ с метасимволами безопасен)
 #
+#  НОВОЕ В v5.0.0 (модульное меню):
+#   • МЕНЮ ПЕРЕРАБОТАНО: плоский список из 26 пунктов собран в 6 групп с
+#     подменю — 1) Установка и настройка 2) ПОЛЬЗОВАТЕЛИ (создать/удалить/
+#     список/сброс трафика/подписки — раньше раскидано по пунктам 3-6 и 20)
+#     3) Reality 4) НОДЫ 5) Обслуживание (серт/health/статус/бэкап/обновление)
+#     6) Мониторинг (дашборд/Telegram/аренда/SSH-хук/реквизиты). Главное меню
+#     помещается в один экран
+#   • МЕНЮ ВЫНЕСЕНО В ОТДЕЛЬНЫЙ ФАЙЛ xkit_menu.sh: UI-слой больше не раздувает
+#     xkit.sh (ядро: API, установка, nginx, ноды, дашборд — не тронуто).
+#     xkit.sh ищет модуль рядом с собой, затем в /usr/local/lib/xkit,
+#     /usr/local/bin и /etc/xkit; при отсутствии — сам докачивает с репо
+#     (XKIT_REPO_URL) со сверкой SHA-256
+#   • install.sh и `xkit update` качают ОБА файла; пломба xkit.sh.sha256 —
+#     формат sha256sum, 2 строки (старые версии читают первую строку —
+#     обновление с v4.x работает без переустановки)
+#   • uninstall чистит /usr/local/lib/xkit; one_step_install/
+#     hide_existing_panel/ssh_hook_toggle обновляют модуль меню вместе
+#     с командой xkit
+#
+#  НОВОЕ В v4.9.1 (совместимость с 3X-UI v3.x — инсталлятор уже ставит 3.11):
+#   • КРИТИЧНО: «Не удалось войти в API панели» сразу после свежей установки
+#     (пункт 2 и все пункты с API). Причина: 3X-UI v3 закрыл ВСЕ POST-запросы
+#     CSRF-мiddleware'ом — без заголовка X-CSRF-Token панель отвечает 403 с
+#     ПУСТЫМ телом (выглядит как «панель не отвечает», в ответе нет «Ответ:»).
+#     Теперь xkit действует как браузер: GET <base>/csrf-token (создаёт сессию
+#     и возвращает токен) → POST /login с X-CSRF-Token; заголовок ставится и во
+#     ВСЕ POST-запросы к /panel/api/*. На 3X-UI v2.x ничего не ломается:
+#     роута csrf-token там нет — xkit работает по-старому
+#   • 3X-UI v3 перенёс эндпоинты: клиенты теперь /panel/api/clients/
+#     {add|del/:email|resetTraffic/:email} (в v2: inbounds/addClient,
+#     inbounds/:id/delClient/:cid — УДАЛЕНЫ в v3), настройки —
+#     /panel/api/setting/*, xray-шаблон — POST /panel/api/xray/ + /update
+#     (xrayTemplateConfig из settings в v3 ВЫВЕДЕН — чтение через старый
+#     endpoint возвращало пустоту, и nodes_apply_template затирал бы конфиг).
+#     xkit определяет поколение API (GET /panel/api/openapi.json есть только
+#     в v3) и шлёт запросы в нужном формате: работают И v3.11, И v2.x
+#   • externalProxy в v3 заменён на host-группы: пункт 19 (extfix), Reality-
+#     inbound и pool-инбаунд нод на v3 создают запись /panel/api/hosts
+#     (remark "xkit", апдейт по groupId — без дублей при повторном запуске)
+#   • kit_login различает: панель не отвечает (curl exit) / 403 (CSRF —
+#     устаревший xkit, подсказка «xkit update») / неверные логин-пароль
+#     (HTTP-код + тело ответа)
+#
 #  НОВОЕ В v4.9.0 (замечания с живой установки):
 #   • ВЫБОР АДРЕСА показывает реальный IP: определённый pubip выводится как
 #     пункт 1 («IP этого сервера — 1.2.3.4»), Enter = согласиться, 2 = свой
@@ -248,7 +291,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="4.9.0"
+XKIT_VERSION="5.0.0"
 # TTY-детект (ревью v4.7.0): при не-терминале (curl|bash, cron, tee, CI) цвета
 # гаснут — в логах не остаётся сырых \033[… кодов. XKIT_NO_COLOR=1 — ручной
 # override; XKIT_NO_ANIM=1 отключает спиннер при живом TTY
@@ -384,6 +427,7 @@ XKIT_DASH_HTPASSWD="/etc/nginx/.xkit-dash.htpasswd"  # Basic Auth дашборд
 XKIT_INFO_FILE="/root/xkit-info.txt"      # сводка-реквизиты (терминал + файл)
 XKIT_NOTIFY_STATE="${XKIT_DIR}/notify.state"  # состояние Telegram-алертов (гистерезис/дедуп)
 XKIT_BIN="/usr/local/bin/xkit"
+XKIT_MENU_DIR="${XKIT_MENU_DIR:-/usr/local/lib/xkit}"  # модуль меню (xkit_menu.sh), v5.0.0
 SUBS_DIR="/var/lib/xkit/subs"
 BACKUP_DIR="/var/backups/xkit"
 # cron-файлы кита — переменные (не хардкод), чтобы uninstall и тесты работали
@@ -1203,26 +1247,74 @@ auto_path_for() { # $1 net (ws|grpc|xhttp|hu|tc)  $2 port
 # Слой для клиентов/автопроброса/подписок. Все ответы панель отдаёт как
 # {"success":true/false,"msg":"...","obj":...}. Всё defensively через jq:
 # если формат API когда-нибудь поменяется — увидите понятную ошибку.
+#
+# ПОКОЛЕНИЯ API (v4.9.1): 3X-UI v3.x (2026) закрыл ВСЕ POST-запросы
+# CSRF-мiddleware'ом (без X-CSRF-Token — ответ 403 С ПУСТЫМ телом) и перенёс
+# клиентские эндпоинты в /panel/api/clients/*, настройки — в /panel/api/setting/*,
+# xray-шаблон — в /panel/api/xray/*. API_V3 определяется в kit_session по
+# GET /panel/api/openapi.json (есть только в v3). На v2 всё по-старому.
 
 api_url() { printf '%s://127.0.0.1:%s%s' "${PANEL_SCHEME:-http}" "${PANEL_PORT}" "${PANEL_WBP}"; }
 
+API_V3=0      # 1 = панель 3X-UI v3+ (CSRF + /panel/api/clients|setting|xray/*)
+CSRF_TOKEN="" # токен сессии для POST (v3+); пусто = панель v2 — заголовок не ставим
+
+curl_panel() { # curl к панели с учётом схемы (свой/самоподписанный серт = -k)
+  local -a a=(-s)
+  [ "${PANEL_SCHEME:-http}" = "https" ] && a+=(-k)
+  curl "${a[@]}" "$@"
+}
+
+csrf_fetch() { # GET <base>/csrf-token -> CSRF_TOKEN (v3+; v2: роута нет, пусто)
+  local out
+  # -b -c: отправляем текущую сессию И обновляем jar (повторный вызов после
+  # логина обязан привязать новый токен к АВТОРИЗОВАННОЙ сессии)
+  out="$(curl_panel --max-time 8 -b "$COOKIE_JAR" -c "$COOKIE_JAR" "$(api_url)csrf-token" 2>/dev/null)" || return 0
+  if jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
+    CSRF_TOKEN="$(jq -r '.obj // ""' <<<"$out" 2>/dev/null || true)"
+  fi
+  return 0
+}
+
 kit_login() {
   COOKIE_JAR="$(mktemp /tmp/xkit-ck.XXXXXX)"; chmod 600 "$COOKIE_JAR"
-  local out url
+  local url rc code out resp
   url="$(api_url)login"
-  if [ "${PANEL_SCHEME:-http}" = "https" ]; then
-    out=$(curl -sk --max-time 8 -c "$COOKIE_JAR" -X POST "$url" \
-      --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
-  else
-    out=$(curl -s --max-time 8 -c "$COOKIE_JAR" -X POST "$url" \
-      --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
+  # 3X-UI v3+: POST /login без CSRF-токена = 403 с ПУСТЫМ телом. GET /csrf-token
+  # создаёт сессию и возвращает токен (как у браузера); v2: 404 — без заголовка
+  csrf_fetch
+  resp="$(mktemp /tmp/xkit-login.XXXXXX)"; chmod 600 "$resp"
+  local -a h=()
+  [ -n "$CSRF_TOKEN" ] && h+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  rc=0
+  code="$(curl_panel --max-time 8 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -o "$resp" -w '%{http_code}' -X POST "${h[@]}" \
+    --data-urlencode "username=${PANEL_USER}" \
+    --data-urlencode "password=${PANEL_PASS}" "$url")" || rc=$?
+  out="$(cat "$resp" 2>/dev/null || true)"; rm -f "$resp"
+  if [ "$rc" -ne 0 ]; then
+    err "Панель не отвечает (127.0.0.1:${PANEL_PORT}, curl exit ${rc}) — проверьте: systemctl status x-ui"
+    return 1
+  fi
+  if [ "$code" = "403" ]; then
+    err "Панель отклонила запрос (403: CSRF-мiddleware) — устаревший xkit для этой версии 3X-UI"
+    err "Обновите меню:  xkit update  (или скачайте свежий xkit.sh из репозитория)"
+    return 1
   fi
   if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "Не удалось войти в API панели (127.0.0.1:${PANEL_PORT}${PANEL_WBP}login)"
-    [ -n "$out" ] && err "Ответ: $(head -c 300 <<<"$out")"
+    err "Не удалось войти в API панели (127.0.0.1:${PANEL_PORT}${PANEL_WBP}login, HTTP ${code})"
+    if [ -n "$out" ]; then
+      err "Ответ: $(head -c 300 <<<"$out")"
+    else
+      err "Тело ответа пустое (HTTP ${code}) — нестандартная сборка 3X-UI или прокси перед панелью"
+    fi
     err "Проверьте логин/пароль панели (install-result.env или меню панели x-ui)"
     return 1
   fi
+  # v4.9.1: после логина панель ЧИСТИТ сессию (SetLoginUser -> s.Clear()) —
+  # CSRF-токен анонимной сессии аннулирован, и все POST вернули бы 403.
+  # Переполучаем токен уже от АВТОРИЗОВАННОЙ сессии — как делает и фронтенд панели
+  csrf_fetch
   return 0
 }
 
@@ -1236,6 +1328,7 @@ api_post() { # $1 путь, $2 JSON-тело (пусто = без тела)
   local url; url="$(api_url)panel/api/inbounds/$1"
   local -a args=(-s --max-time 15 -b "$COOKIE_JAR" -X POST)
   [ "${PANEL_SCHEME:-http}" = "https" ] && args+=(-k)
+  [ -n "$CSRF_TOKEN" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
   if [ -n "${2:-}" ]; then
     curl "${args[@]}" -H 'Content-Type: application/json' -d "$2" "$url"
   else
@@ -1283,22 +1376,47 @@ api_del_inbound() { # $1 id
   return 0
 }
 
-api_add_client() { # $1 id инбаунда, $2 НОВАЯ строка settings (JSON)
-  local body resp
-  body="$(jq -n --arg id "$1" --arg s "$2" '{"id":($id|tonumber),"settings":$s}')"
-  resp="$(api_post addClient "$body")" || return 1
+api_post_json() { # $1 путь от base, $2 JSON-тело — для эндпоинтов вне /panel/api/inbounds
+  local url; url="$(api_url)${1#/}"
+  local -a args=(-s --max-time 20 -b "$COOKIE_JAR" -X POST -H 'Content-Type: application/json')
+  [ "${PANEL_SCHEME:-http}" = "https" ] && args+=(-k)
+  [ -n "$CSRF_TOKEN" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  curl "${args[@]}" -d "$2" "$url"
+}
+
+# v4.9.1: 3X-UI v3 перенёс клиентов в /panel/api/clients/*:
+#   add     POST /panel/api/clients/add              {"client":{...},"inboundIds":[id]}
+#   del     POST /panel/api/clients/del/:email
+#   reset   POST /panel/api/clients/resetTraffic/:email
+# (старые v2-пути inbounds/addClient, inbounds/:id/delClient/:cid в v3 УДАЛЕНЫ)
+api_add_client() { # $1 id инбаунда, $2 JSON ОДНОГО клиента, $3 текущая строка settings (для v2)
+  local id="$1" cj="$2" settings="$3" resp
+  if [ "$API_V3" = "1" ]; then
+    local body
+    body="$(jq -nc --argjson c "$cj" --argjson i "$id" '{client:$c, inboundIds:[$i]}')"
+    resp="$(api_post_json "panel/api/clients/add" "$body")" || return 1
+  else
+    local body new_settings
+    new_settings="$(jq -c --argjson c "$cj" '.clients += [$c]' <<<"$settings")" || return 1
+    body="$(jq -n --arg id "$id" --arg s "$new_settings" '{"id":($id|tonumber),"settings":$s}')"
+    resp="$(api_post addClient "$body")" || return 1
+  fi
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "addClient: $(jq -r '.msg // "ошибка"' <<<"$resp" | head -c 200)"
+    err "addClient: $(jq -r '.msg // "ошибка"' <<<"$resp" 2>/dev/null | head -c 200)"
     return 1
   fi
   return 0
 }
 
-api_del_client() { # $1 id инбаунда, $2 clientId (uuid); путь /:id/delClient/:clientId
+api_del_client() { # $1 id инбаунда, $2 email, $3 clientId (uuid; нужен только v2)
   local resp
-  resp="$(api_post "$1/delClient/$2" "")" || return 1
+  if [ "$API_V3" = "1" ]; then
+    resp="$(api_post_raw "panel/api/clients/del/$2")" || return 1
+  else
+    resp="$(api_post "$1/delClient/$3" "")" || return 1
+  fi
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "delClient: $(jq -r '.msg // "ошибка"' <<<"$resp" | head -c 200)"
+    err "delClient: $(jq -r '.msg // "ошибка"' <<<"$resp" 2>/dev/null | head -c 200)"
     return 1
   fi
   return 0
@@ -1311,7 +1429,21 @@ kit_session() {
   read_panel_settings || return 1
   PANEL_SCHEME=$(detect_panel_scheme "$PANEL_PORT")
   kit_login || return 1
+  api_detect_generation
   INBOUNDS="$(api_list)" || return 1
+  return 0
+}
+
+# поколение API: GET /panel/api/openapi.json отвечает JSON-ом только в v3+
+# (v2: 404/SPA). Лениво и без цензуры: не определили — считаем v2 (старые пути)
+api_detect_generation() {
+  local out
+  API_V3=0
+  out="$(api_get_raw "panel/api/openapi.json" 2>/dev/null || true)"
+  if jq -e '.openapi' <<<"$out" >/dev/null 2>&1; then
+    API_V3=1
+    log "Панель 3X-UI v3: клиенты/настройки через /panel/api/clients|setting|xray/*"
+  fi
   return 0
 }
 
@@ -1903,10 +2035,8 @@ client_add() {
        expiryTime:$exp, enable:true, tgId:"", subId:$sub, reset:0}')"
   fi
 
-  local new_settings
-  new_settings="$(jq -c --argjson c "$cj" '.clients += [$c]' <<<"$settings")"
   log "Добавляю пользователя через API панели..."
-  if ! api_add_client "$id" "$new_settings"; then return 1; fi
+  if ! api_add_client "$id" "$cj" "$settings"; then return 1; fi
   ok "Пользователь '$email' добавлен в инбаунд #$id"
 
   # свежая ссылка + подписка
@@ -1950,7 +2080,7 @@ client_del() {
   [ -n "$cid" ] || { err "Не найден id клиента"; return 1; }
   read -r -p "Удалить '$email'? [y/N]: " a
   [[ "$a" =~ ^[Yy] ]] || { warn "Отменено"; return 0; }
-  if api_del_client "$id" "$cid"; then
+  if api_del_client "$id" "$email" "$cid"; then
     ok "Пользователь '$email' удалён"
     sub_regen_quiet || true
   fi
@@ -2454,8 +2584,9 @@ xkit_uninstall() {
     ok "3X-UI и /etc/nginx/ssl удалены (--full)"
   fi
 
-  if [ "${KEEP_BIN:-0}" != "1" ] && [ -f "$XKIT_BIN" ]; then
-    rm -f "$XKIT_BIN" && ok "Команда xkit удалена"
+  if [ "${KEEP_BIN:-0}" != "1" ]; then
+    [ -f "$XKIT_BIN" ] && rm -f "$XKIT_BIN" && ok "Команда xkit удалена"
+    [ -d "$XKIT_MENU_DIR" ] && rm -rf "$XKIT_MENU_DIR" && ok "Модуль меню удалён ($XKIT_MENU_DIR)"
   fi
 
   xkit_install_traps_off
@@ -2573,6 +2704,7 @@ one_step_install() {
     cp -f "$(readlink -f "$0")" "$XKIT_BIN" && chmod 700 "$XKIT_BIN" \
       && ok "Меню установлено: введите в SSH команду xkit"
   fi
+  xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
 
   echo ""
   echo -e "${GREEN}============================================================${NC}"
@@ -2649,6 +2781,7 @@ hide_existing_panel() {
   fi
   save_xkit_env
   if [ -f "$0" ]; then cp -f "$(readlink -f "$0")" "$XKIT_BIN" && chmod 700 "$XKIT_BIN"; fi
+  xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
   ok "Панель доступна ТОЛЬКО через: https://${XKIT_HOST}${PANEL_WBP}"
   log "Дальше: инбаунды с Listen IP = 127.0.0.1, затем пункт 2 (автопроброс)"
   xkit_summary_save >/dev/null 2>&1 || true
@@ -2668,17 +2801,43 @@ api_post_raw() { # $1 путь, остальные — аргументы curl (
   local url; url="$(api_url)${p#/}"
   local -a a=(-s --max-time 20 -b "$COOKIE_JAR" -X POST)
   [ "${PANEL_SCHEME:-http}" = "https" ] && a+=(-k)
+  [ -n "$CSRF_TOKEN" ] && a+=(-H "X-CSRF-Token: $CSRF_TOKEN")
   curl "${a[@]}" "$url" "$@"
+}
+
+# v4.9.1: в 3X-UI v3 externalProxy у инбаунда ВЫВЕДЕН — вместо него host-группы
+# /panel/api/hosts ( remark "xkit", адрес+порт+security). Апдейт по groupId, если
+# группа уже есть — без дублей при повторном запуске.
+v3_host_upsert() { # $1 id инбаунда, $2 адрес, $3 порт, $4 security (tls|same|reality)
+  local id="$1" addr="$2" eport="$3" sec="$4" resp gid body
+  body="$(jq -nc --argjson ids "[${id}]" --arg a "$addr" --argjson p "$eport" --arg s "$sec" \
+    '{inboundIds:$ids, remark:"xkit", hosts:[$a], port:$p, security:$s}')"
+  resp="$(api_get_raw "panel/api/hosts/list" 2>/dev/null || true)"
+  gid="$(jq -r --argjson id "$id" \
+    '[.obj[]? | select(((.inboundIds // []) | index($id)) and ((.remark // "") == "xkit"))][0].groupId // empty' \
+    <<<"$resp" 2>/dev/null || true)"
+  if [ -n "$gid" ]; then
+    resp="$(api_post_json "panel/api/hosts/update/${gid}" "$body")"
+  else
+    resp="$(api_post_json "panel/api/hosts/add" "$body")"
+  fi
+  jq -e '.success == true' <<<"$resp" >/dev/null 2>&1
 }
 
 panel_settings_get() {
   local out
-  out="$(api_get_raw "panel/setting/all")"
-  if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    out="$(api_post_raw "panel/setting/all")"
+  if [ "$API_V3" = "1" ]; then
+    # v3: /panel/api/setting/all только POST (и возвращает browser-safe view:
+    # секреты скрыты, но sub*/xray-поля на месте)
+    out="$(api_post_json "panel/api/setting/all" "{}")"
+  else
+    out="$(api_get_raw "panel/setting/all")"
+    if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
+      out="$(api_post_raw "panel/setting/all")"
+    fi
   fi
   if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "panel/setting/all: $(jq -r '.msg // "нет ответа"' <<<"$out" 2>/dev/null | head -c 200)"
+    err "panel settings: $(jq -r '.msg // "нет ответа"' <<<"$out" 2>/dev/null | head -c 200)"
     return 1
   fi
   printf '%s' "$out"
@@ -2688,10 +2847,11 @@ panel_settings_set() { # пары key=value (form-urlencoded, панель об�
   local -a args=()
   local kv
   for kv in "$@"; do args+=(--data-urlencode "$kv"); done
-  local resp
-  resp="$(api_post_raw "panel/setting/update" "${args[@]}")"
+  local resp p
+  if [ "$API_V3" = "1" ]; then p="panel/api/setting/update"; else p="panel/setting/update"; fi
+  resp="$(api_post_raw "$p" "${args[@]}")"
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "panel/setting/update: $(jq -r '.msg // "нет ответа"' <<<"$resp" 2>/dev/null | head -c 200)"
+    err "${p}: $(jq -r '.msg // "нет ответа"' <<<"$resp" 2>/dev/null | head -c 200)"
     return 1
   fi
   return 0
@@ -2699,7 +2859,8 @@ panel_settings_set() { # пары key=value (form-urlencoded, панель об�
 
 panel_restart() {
   local p out
-  for p in "panel/setting/restartPanel" "server/restartPanel"; do
+  # v3: /panel/api/setting/restartPanel; v2: panel/setting/restartPanel, server/restartPanel
+  for p in "panel/api/setting/restartPanel" "panel/setting/restartPanel" "server/restartPanel"; do
     out="$(api_post_raw "$p")" || true
     if jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
       ok "Панель перезапускается..."
@@ -2813,6 +2974,16 @@ external_proxy_fix() {
       same=$((same+1)); continue   # прямым инбаундам (Reality/relay) externalProxy не нужен
     fi
     if [ "$mode" = "local" ]; then eport=443; else eport="$port"; fi
+    if [ "$API_V3" = "1" ]; then
+      # v3: externalProxy заменён host-группами; апдейт идемпотентен (по groupId)
+      if v3_host_upsert "$id" "$XKIT_HOST" "$eport" "tls"; then
+        ok "#$id: внешний адрес ${XKIT_HOST}:${eport} (hosts)"
+        fixed=$((fixed+1))
+      else
+        err "#$id: host-группа не применилась"
+      fi
+      continue
+    fi
     cur="$(jq -c '.externalProxy // []' <<<"$ib")"
     new="$(jq -nc --arg d "$XKIT_HOST" --argjson p "$eport" '[{"dest":$d,"port":$p,"remark":"xkit"}]')"
     if [ "$cur" = "$new" ]; then same=$((same+1)); continue; fi
@@ -3041,7 +3212,12 @@ reality_create_inbound() {
   ibid="$(jq -r --arg t "inbound-${p}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$newlist")"
   if [ -n "$ibid" ]; then
     fresh="$(api_get_inbound "$ibid")" || true
-    if [ -n "$fresh" ]; then
+    if [ "$API_V3" = "1" ]; then
+      # v3: externalProxy заменён host-группами; Reality наследует security (same)
+      v3_host_upsert "$ibid" "$XKIT_HOST" "$p" "same" \
+        && ok "Внешний адрес в панели (hosts): ${XKIT_HOST}:${p}" \
+        || warn "Не удалось создать host-группу для Reality-инбаунда (ссылки в панели — вручную)"
+    elif [ -n "$fresh" ]; then
       fresh="$(jq -c --arg d "$XKIT_HOST" --argjson p "$p" \
         '.externalProxy = [{"dest":$d,"port":$p,"remark":"xkit"}]' <<<"$fresh")"
       api_update_inbound "$ibid" "$fresh" >/dev/null 2>&1 || true
@@ -3269,7 +3445,11 @@ nodes_ensure_pool() {
   ibid="$(jq -r --arg t "inbound-${port}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$newlist")"
   [ -n "$ibid" ] || { err "Pool-инбаунд создан, но id не найден"; return 1; }
   fresh="$(api_get_inbound "$ibid")" || true
-  if [ -n "$fresh" ]; then
+  if [ "$API_V3" = "1" ]; then
+    # v3: externalProxy заменён host-группами; pool за nginx = tls на 443
+    v3_host_upsert "$ibid" "$XKIT_HOST" 443 "tls" || \
+      warn "host-группа pool не создалась (ссылки в панели покажут 127.0.0.1 — пункт 19 пересоздаст)"
+  elif [ -n "$fresh" ]; then
     fresh="$(jq -c --arg d "$XKIT_HOST" '.externalProxy = [{"dest":$d,"port":443,"remark":"xkit"}]' <<<"$fresh")"
     api_update_inbound "$ibid" "$fresh" >/dev/null 2>&1 || true
   fi
@@ -3358,13 +3538,34 @@ PY
 
 nodes_apply_template() {
   local nodes_json; nodes_json="$(nodes_load)"
-  local all cur merged
-  all="$(panel_settings_get)" || return 1
-  cur="$(jq -r '.obj.xrayTemplateConfig // "{}"' <<<"$all")"
+  local cur merged resp
+  if [ "$API_V3" = "1" ]; then
+    # v3: xrayTemplateConfig ИЗ settings ВЫВЕДЕН — шаблон живёт в /panel/api/xray
+    # (GET-ответ: {.obj.xraySetting:<объект конфига>,...}; запись: POST /update,
+    # поле формы xraySetting; панель сама рестартует xray)
+    resp="$(api_post_json "panel/api/xray/" "{}")"
+    if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
+      err "panel/api/xray: $(jq -r '.msg // "нет ответа"' <<<"$resp" 2>/dev/null | head -c 200)"
+      return 1
+    fi
+    cur="$(jq -c '.obj.xraySetting // {}' <<<"$resp")"
+  else
+    local all
+    all="$(panel_settings_get)" || return 1
+    cur="$(jq -r '.obj.xrayTemplateConfig // "{}"' <<<"$all")"
+  fi
   jq -e . <<<"$cur" >/dev/null 2>&1 || cur="{}"
   merged="$(nodes_merge_template "$cur" "$nodes_json" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-roundRobin}")" \
     || { err "Не удалось собрать шаблон xray"; return 1; }
-  panel_settings_set "xrayTemplateConfig=${merged}" || return 1
+  if [ "$API_V3" = "1" ]; then
+    resp="$(api_post_raw "panel/api/xray/update" --data-urlencode "xraySetting=${merged}")"
+    if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
+      err "panel/api/xray/update: $(jq -r '.msg // "нет ответа"' <<<"$resp" 2>/dev/null | head -c 200)"
+      return 1
+    fi
+  else
+    panel_settings_set "xrayTemplateConfig=${merged}" || return 1
+  fi
   xray_restart
   return 0
 }
@@ -4044,7 +4245,11 @@ client_reset() {
   read -r -p "Сбросить трафик '$email'? [y/N]: " a
   [[ "$a" =~ ^[Yy] ]] || return 0
   local resp
-  resp="$(api_post_raw "panel/api/inbounds/${id}/resetClientTraffic/${email}")"
+  if [ "$API_V3" = "1" ]; then
+    resp="$(api_post_raw "panel/api/clients/resetTraffic/${email}")"
+  else
+    resp="$(api_post_raw "panel/api/inbounds/${id}/resetClientTraffic/${email}")"
+  fi
   if jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
     ok "Трафик '$email' сброшен"
   else
@@ -4061,6 +4266,7 @@ ssh_hook_toggle() {
     cp -f "$(readlink -f "$0")" "$XKIT_BIN" && chmod 700 "$XKIT_BIN" \
       && ok "Команда xkit установлена/обновлена: $XKIT_BIN"
   fi
+  xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
   if grep -q "# >>> xkit-menu >>>" /root/.bashrc 2>/dev/null; then
     sed -i '/# >>> xkit-menu >>>/,/# <<< xkit-menu <<</d' /root/.bashrc
     ok "Авто-меню при входе по SSH ВЫКЛЮЧЕНО (запускайте xkit вручную)"
@@ -5439,6 +5645,9 @@ xkit_summary_save() { # тихо: только файл (вызывается п
 }
 
 #=========================== ОБНОВЛЕНИЕ =======================================
+# v5.0.0: обновляются ОБА файла — xkit.sh (ядро) и xkit_menu.sh (модуль меню).
+# Пломба xkit.sh.sha256 — формат sha256sum, 2 строки; строка 1 = xkit.sh,
+# строка 2 = xkit_menu.sh (старые версии читают строку 1 — совместимость)
 xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_REPO_URL из xkit.env)
   require_root
   load_xkit_env 2>/dev/null || true   # свежая SSH-сессия: XKIT_REPO_URL живёт в xkit.env
@@ -5450,121 +5659,149 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
     return 1
   fi
   case "$base" in */xkit.sh) base="${base%/*}" ;; esac
-  local tmp; tmp="$(mktemp /tmp/.xkit-update.XXXXXX)"
+  local tmp tmpm sumf
+  tmp="$(mktemp /tmp/.xkit-update.XXXXXX)" || return 1
   log "Скачиваю ${base}/xkit.sh ..."
   curl -fsSL "${base}/xkit.sh" -o "$tmp" || { err "Скачать не удалось: ${base}/xkit.sh"; rm -f "$tmp"; return 1; }
-  local sumf="${tmp}.sha256"
+  # модуль меню — обязателен с v5.0.0 (UI-слой вынесен в отдельный файл)
+  tmpm="$(mktemp /tmp/.xkit-menu.XXXXXX)" || { rm -f "$tmp"; return 1; }
+  if ! curl -fsSL "${base}/xkit_menu.sh" -o "$tmpm"; then
+    if [ -r "${XKIT_MENU_DIR}/xkit_menu.sh" ]; then
+      warn "xkit_menu.sh в репо не найден — оставляю установленный (${XKIT_MENU_DIR})"
+      tmpm=""
+    else
+      err "Скачать не удалось: ${base}/xkit_menu.sh (файл меню)"
+      err "Залейте xkit_menu.sh в репозиторий (см. GITHUB_SETUP.md) или обновите снова позже"
+      rm -f "$tmp" "$tmpm"; return 1
+    fi
+  fi
+  local sumf="${tmp}.sha256" want got
   if curl -fsSL "${base}/xkit.sh.sha256" -o "$sumf" 2>/dev/null; then
-    local want got
     want="$(awk 'NR==1{print $1}' "$sumf")"; got="$(sha256sum "$tmp" | awk '{print $1}')"
     if [ -n "$want" ] && [ "$want" = "$got" ]; then
-      ok "SHA-256 проверен: $got"
+      ok "SHA-256 проверен: xkit.sh $got"
     else
       err "SHA-256 НЕ совпал — обновление отменено (файл битый или изменён)"
-      rm -f "$tmp" "$sumf"; return 1
+      rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
+      return 1
+    fi
+    if [ -n "$tmpm" ]; then
+      want="$(awk '$2=="xkit_menu.sh"{print $1; exit}' "$sumf")"
+      got="$(sha256sum "$tmpm" | awk '{print $1}')"
+      if [ -n "$want" ] && [ "$want" != "$got" ]; then
+        err "SHA-256 xkit_menu.sh НЕ совпал — обновление отменено"
+        rm -f "$tmp" "$sumf" "$tmpm"; return 1
+      fi
+      ok "SHA-256 проверен: xkit_menu.sh $got"
     fi
   else
     warn "xkit.sh.sha256 недоступен — ставлю без проверки контрольной суммы"
   fi
-  bash -n "$tmp" || { err "Новый файл не проходит bash -n — обновление отменено"; rm -f "$tmp" "$sumf"; return 1; }
+  bash -n "$tmp" || { err "Новый файл не проходит bash -n — обновление отменено"; rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"; return 1; }
+  if [ -n "$tmpm" ]; then
+    bash -n "$tmpm" || { err "Новый xkit_menu.sh не проходит bash -n — обновление отменено"; rm -f "$tmp" "$sumf" "$tmpm"; return 1; }
+  fi
   local nv; nv="$(grep -m1 '^XKIT_VERSION=' "$tmp" | cut -d'"' -f2)"; nv="${nv:-?}"
   if [ "$nv" = "$XKIT_VERSION" ] && [ "${XKIT_FORCE:-0}" != "1" ]; then
     ok "Уже установлена версия $nv (принудительно: XKIT_FORCE=1 xkit update)"
-    rm -f "$tmp" "$sumf"; return 0
+    rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
+    return 0
   fi
   [ -f "$XKIT_BIN" ] && cp -f "$XKIT_BIN" "${XKIT_BIN}.bak"
   if ! install -m 700 "$tmp" "${XKIT_BIN}.new" || ! mv -f "${XKIT_BIN}.new" "$XKIT_BIN"; then
-    err "Не удалось заменить $XKIT_BIN"; rm -f "$tmp" "$sumf"; return 1
+    err "Не удалось заменить $XKIT_BIN"; rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"; return 1
   fi
-  rm -f "$tmp" "$sumf"
+  if [ -n "$tmpm" ]; then
+    mkdir -p "$XKIT_MENU_DIR" 2>/dev/null || true
+    [ -f "${XKIT_MENU_DIR}/xkit_menu.sh" ] && cp -f "${XKIT_MENU_DIR}/xkit_menu.sh" "${XKIT_MENU_DIR}/xkit_menu.sh.bak"
+    if install -m 700 "$tmpm" "${XKIT_MENU_DIR}/xkit_menu.sh.new" \
+       && mv -f "${XKIT_MENU_DIR}/xkit_menu.sh.new" "${XKIT_MENU_DIR}/xkit_menu.sh"; then
+      ok "Модуль меню обновлён: ${XKIT_MENU_DIR}/xkit_menu.sh"
+    else
+      err "Не удалось обновить ${XKIT_MENU_DIR}/xkit_menu.sh — меню докачается при первом запуске xkit"
+    fi
+  fi
+  rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
   return 0
 }
 
-#=========================== ГЛАВНОЕ МЕНЮ (как у x-ui) ========================
-show_menu() {
-  load_xkit_env 2>/dev/null || true
-  local _nc; _nc="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
-  echo ""
-  echo -e "${GREEN}============================================================${NC}"
-  echo -e "${GREEN}   XKIT v${XKIT_VERSION} — nginx + 3X-UI${XKIT_HOST:+   |   ${XKIT_HOST}}${NC}"
-  echo -e "${GREEN}   Режим: $([ "$_nc" -gt 0 ] && echo "мастер (${_nc} нод)" || echo "одиночный сервер")${NC}"
-  echo -e "${GREEN}============================================================${NC}"
-  echo -e "${YELLOW} 1)${NC} Установка одним шагом (3X-UI + nginx + SSL + панель за nginx)"
-  echo -e "${YELLOW} 2)${NC} АВТОПРОБРОС: все инбаунды → 127.0.0.1 за nginx + подписки"
-  echo -e "${YELLOW} 3)${NC} Подписки: перегенерировать и показать URL"
-  echo -e "${YELLOW} 4)${NC} Пользователь: создать"
-  echo -e "${YELLOW} 5)${NC} Пользователь: удалить"
-  echo -e "${YELLOW} 6)${NC} Пользователи: список + ссылки"
-  echo -e "${YELLOW} 7)${NC} Проверка жизнеспособности (и «что светится наружу»)"
-  echo -e "${YELLOW} 8)${NC} Бэкап: сделать сейчас"
-  echo -e "${YELLOW} 9)${NC} Бэкап: восстановить из последнего"
-  echo -e "${YELLOW}10)${NC} Сертификат: перевыпустить (домен / IP / self-signed)"
-  echo -e "${YELLOW}11)${NC} Статус: сервисы, порты, маршруты"
-  echo -e "${YELLOW}12)${NC} Спрятать УЖЕ установленную панель 3X-UI за nginx"
-  echo -e "${YELLOW}13)${NC} Ручной relay-маршрут (проброс пути на другой сервер)"
-  echo -e "${YELLOW}14)${NC} Reality: создать inbound (свой сайт / скан / известные / вручную)"
-  echo -e "${YELLOW}15)${NC} Reality: скан подсети — найти dest-кандидаты"
-  echo -e "${YELLOW}16)${NC} Reality: показать ключи и ссылки"
-  echo -e "${YELLOW}17)${NC} НОДЫ: добавить ноду по SSH (3X-UI + туннель + балансировка)"
-  echo -e "${YELLOW}18)${NC} НОДЫ: список / health / стратегия / удалить (подменю)"
-  echo -e "${YELLOW}19)${NC} Панель: корректные ссылки и подписки (externalProxy)"
-  echo -e "${YELLOW}20)${NC} Пользователь: сбросить трафик"
-  echo -e "${YELLOW}21)${NC} SSH: авто-меню при входе вкл/выкл (+ обновить команду xkit)"
-  echo -e "${YELLOW}22)${NC} Обновить xkit из репозитория (проверка SHA-256, бэкап)"
-  echo -e "${YELLOW}23)${NC} ВЕБ-ДАШБОРД: статусы нод, каналы, трафик (секретный URL)"
-  echo -e "${YELLOW}24)${NC} СРОКИ АРЕНДЫ серверов: мастер + ноды (expiry)"
-  echo -e "${YELLOW}25)${NC} Реквизиты: сводка в терминал (пароли — только в /root/xkit-info.txt)"
-  echo -e "${YELLOW}26)${NC} Telegram: алерты (ноды/аренда/сертификат/дашборд)"
-  echo -e "${YELLOW} 0)${NC} Выход"
-  echo ""
+#=========================== МЕНЮ: МОДУЛЬНЫЙ UI (v5.0.0) ======================
+# Меню живёт в отдельном файле xkit_menu.sh (UI-слой), чтобы xkit.sh не
+# раздувался: правки меню не трогают ядро. Порядок поиска:
+#   1) рядом с самим xkit.sh   2) $XKIT_MENU_DIR (/usr/local/lib/xkit)
+#   3) каталог команды xkit    4) /etc/xkit
+# Не нашли — докачиваем с XKIT_REPO_URL со сверкой SHA-256 (строка 2 пломбы).
+xkit_menu_src() { # -> печатает путь к найденному xkit_menu.sh; 1 = не нашли
+  local d f self
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  for d in "$(dirname "$self")" "${XKIT_MENU_DIR}" "${XKIT_BIN%/*}" "/etc/xkit"; do
+    [ -n "$d" ] || continue
+    f="$d/xkit_menu.sh"
+    if [ -r "$f" ]; then printf '%s\n' "$f"; return 0; fi
+  done
+  return 1
 }
 
-pause_enter() { echo ""; read -r -p "Нажмите Enter для возврата в меню..." _; }
+xkit_menu_fetch() { # авто-докачка меню (потеря файла / обновление со старой версии)
+  local base="${XKIT_REPO_URL:-}"
+  [ -n "$base" ] || return 1
+  case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  mkdir -p "$XKIT_MENU_DIR" 2>/dev/null || return 1
+  local tmp sumf want got
+  tmp="$(mktemp /tmp/.xkit-menu.XXXXXX)" || return 1
+  curl -fsSL "${base}/xkit_menu.sh" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  sumf="$(mktemp /tmp/.xkit-menu-sum.XXXXXX)" || { rm -f "$tmp"; return 1; }
+  if curl -fsSL "${base}/xkit.sh.sha256" -o "$sumf" 2>/dev/null; then
+    want="$(awk '$2=="xkit_menu.sh"{print $1; exit}' "$sumf")"
+    got="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [ -n "$want" ] && [ "$want" != "$got" ]; then
+      err "SHA-256 xkit_menu.sh НЕ совпал — докачка отменена"
+      rm -f "$tmp" "$sumf"; return 1
+    fi
+  else
+    warn "Сумма xkit_menu.sh недоступна — ставлю без проверки"
+  fi
+  bash -n "$tmp" 2>/dev/null || { err "xkit_menu.sh не проходит bash -n — докачка отменена"; rm -f "$tmp" "$sumf"; return 1; }
+  if install -m 700 "$tmp" "${XKIT_MENU_DIR}/xkit_menu.sh.new" \
+     && mv -f "${XKIT_MENU_DIR}/xkit_menu.sh.new" "${XKIT_MENU_DIR}/xkit_menu.sh"; then
+    ok "Модуль меню докачан: ${XKIT_MENU_DIR}/xkit_menu.sh"
+  fi
+  local rc=$?
+  rm -f "$tmp" "$sumf"
+  return $rc
+}
 
-menu_loop() {
-  while true; do
-    show_menu
-    read -r -p "Выбор: " choice || { echo; exit 0; }   # EOF (cron/pipe) — выходим, не зацикливаемся
-    case "$choice" in
-      1) one_step_install; pause_enter ;;
-      2) auto_route; pause_enter ;;
-      3) sub_regen; pause_enter ;;
-      4) client_add; pause_enter ;;
-      5) client_del; pause_enter ;;
-      6) client_list; pause_enter ;;
-      7) health_check; pause_enter ;;
-      8) backup_now; pause_enter ;;
-      9) backup_restore; pause_enter ;;
-      10)
-        [ -n "${XKIT_HOST:-}" ] || die "Сначала установка"
-        choose_certificate "$XKIT_HOST" "$(host_kind "$XKIT_HOST")" || { pause_enter; continue; }
-        XKIT_CRT="$FINAL_CRT"; XKIT_KEY="$FINAL_KEY"; XKIT_CERT_MODE="$CERT_MODE"
-        save_xkit_env
-        regen_conf_and_apply
-        warn "Клиентам могут понадобиться новые файлы серта (для IP-сертов — обновите подписку)"
-        pause_enter ;;
-      11) show_status; pause_enter ;;
-      12) hide_existing_panel; pause_enter ;;
-      13) add_relay_route; pause_enter ;;
-      14) reality_wizard; pause_enter ;;
-      15) reality_scan_menu; pause_enter ;;
-      16) reality_show_keys; pause_enter ;;
-      17) node_add; pause_enter ;;
-      18) nodes_menu ;;
-      19) external_proxy_fix; pause_enter ;;
-      20) client_reset; pause_enter ;;
-      21) ssh_hook_toggle; pause_enter ;;
-      22) xkit_self_update; pause_enter ;;
-      23) dash_menu ;;
-      24) expiry_menu ;;
-      25) xkit_info; pause_enter ;;
-      26) telegram_menu ;;
-      0) exit 0 ;;
-      *) warn "Нет такого пункта" ;;
-    esac
-  done
+xkit_menu_install() { # положить модуль меню в $XKIT_MENU_DIR (вызывается установщиком)
+  local self src
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  src="$(dirname "$self")/xkit_menu.sh"
+  if [ -r "$src" ]; then
+    mkdir -p "$XKIT_MENU_DIR" 2>/dev/null || return 1
+    cp -f "$src" "${XKIT_MENU_DIR}/xkit_menu.sh" && chmod 700 "${XKIT_MENU_DIR}/xkit_menu.sh" \
+      && ok "Модуль меню: ${XKIT_MENU_DIR}/xkit_menu.sh"
+    return 0
+  fi
+  # рядом со скриптом нет (установка из пайпа) — докачаем с репо
+  xkit_menu_fetch \
+    || warn "xkit_menu.sh не найден рядом и не докачан — меню скачается при первом запуске xkit"
+  return 0
+}
+
+xkit_load_menu() { # подключить модуль меню (source); 1 = не нашли (ошибка уже напечатана)
+  local f
+  if f="$(xkit_menu_src)" && . "$f"; then return 0; fi
+  # load_xkit_env при ОТСУТСТВИИ env-файла (свежая машина) затирает
+  # XKIT_REPO_URL и выходит раньше восстановления — репо-адрес из внешнего
+  # env (install.sh пробрасывает его явно) терялся, авто-докачка молчала
+  local _repo="${XKIT_REPO_URL:-}"
+  load_xkit_env >/dev/null 2>&1 || true
+  [ -n "${XKIT_REPO_URL:-}" ] || XKIT_REPO_URL="$_repo"
+  if xkit_menu_fetch && f="$(xkit_menu_src)" && . "$f"; then return 0; fi
+  err "Не найден файл меню xkit_menu.sh (ищу рядом со скриптом, в ${XKIT_MENU_DIR} и /etc/xkit)"
+  err "Обновите установку:  sudo xkit update   либо переустановите через install.sh"
+  return 1
 }
 
 usage() {
@@ -5572,7 +5809,7 @@ usage() {
 XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню как у родного x-ui
 
 Использование:
-  xkit                 — интерактивное меню
+  xkit                 — интерактивное меню (6 групп с подменю)
   xkit install         — установка одним шагом (при уже установленном — меню:
                          обновить / переустановить чисто / починить поверх)
   xkit reinstall       — ЧИСТАЯ переустановка: бэкап -> полное удаление -> установка
@@ -5619,7 +5856,7 @@ EOF
 
 main() {
   case "${1:-menu}" in
-    menu|"") menu_loop ;;
+    menu|"") xkit_load_menu || exit 1; menu_loop ;;
     install) require_root; one_step_install ;;
     reinstall) require_root; xkit_reinstall ;;
     uninstall) shift; require_root; xkit_uninstall "${1:-}" ;;
