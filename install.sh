@@ -26,7 +26,7 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kalsifar/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="83d161fece6bac20f8424f1b7533e53ee22e69c59a6b10f24993a61d459f6497"
+XKIT_PIN_SHA256="1e8d57067c9512435e6587c91c1aa2fa5c0f991c415e5abe4962938521ad50b5"
 XKIT_PIN_MENU_SHA256="732b5f5d740d5a0135936cefb70ac69922057eb127c9caa4af4b64d818dc7ff0"
 XKIT_PIN_PROTOCOLS_SHA256="5bc6172ef775f11a81fa6b875e4468cc6c9b8787e0d62cf671dc1accbf4614d2"
 XKIT_PIN_TUI_AMD64_SHA256="0273fefdc7b7c712a83fdb12cda1f1c4baee16f7f8a3f0e0cadfad89ab289d71"
