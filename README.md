@@ -77,7 +77,7 @@
 ### Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/НИК/xkit/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/kalsifar/xkit/main/install.sh | sudo bash
 ```
 
 `install.sh` скачает `xkit.sh`, проверит SHA-256, отдаст установщику терминал (пароль `sudo` и все вопросы мастера установки работают даже при `curl | bash`) и запустит установку.
