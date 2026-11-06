@@ -478,7 +478,9 @@ ensure_dirs() {
   mkdir -p "$XMESH_DIR" "$XMESH_SSH_DIR" "$XMESH_NODES_DIR" "$XMESH_GROUPS_DIR" \
            "$XMESH_USERS_DIR" "$XMESH_SUBS_DIR" "$XMESH_LIB_DIR"
   chmod 700 "$XMESH_DIR" "$XMESH_SSH_DIR" "$XMESH_NODES_DIR" "$XMESH_GROUPS_DIR" "$XMESH_USERS_DIR"
-  chmod 755 "$XMESH_SUBS_DIR"
+  # S-04 (аудит №2): подписки — bearer-креды; читать должен только nginx
+  chmod 750 "$XMESH_SUBS_DIR"
+  chgrp www-data "$XMESH_SUBS_DIR" 2>/dev/null || true
 }
 
 deps_install() {
@@ -577,8 +579,11 @@ panel_login() {
   pass=$(env_get_secret PANEL_PASS_B64)
   [ -n "$port" ] && [ -n "$user" ] && [ -n "$pass" ] || { err "Нет сохранённых данных панели ($XMESH_ENV)"; return 1; }
   rt="$(mktemp /tmp/.xmesh_plogin.XXXXXX)"; chmod 600 "$rt"
-  curl -s --noproxy '*' -m 10 -c "$PANEL_COOKIE" -X POST "http://127.0.0.1:${port}/login" \
-    --data-urlencode "username=${user}" --data-urlencode "password=${pass}" -o "$rt" 2>/dev/null \
+  # V-03 (аудит №2): пароль через stdin (--data @-), не в argv (ps/proc)
+  printf 'username=%s&password=%s' \
+    "$(jq -rn --arg v "$user" '$v|@uri')" "$(jq -rn --arg v "$pass" '$v|@uri')" \
+  | curl -s --noproxy '*' -m 10 -c "$PANEL_COOKIE" -X POST "http://127.0.0.1:${port}/login" \
+      -H 'Content-Type: application/x-www-form-urlencoded' --data @- -o "$rt" 2>/dev/null \
     || { rm -f "$rt"; return 1; }
   jq -e '.success == true' "$rt" >/dev/null 2>&1
   local rc=$?; rm -f "$rt"; return $rc
@@ -591,14 +596,14 @@ panel_call() {
   [ -n "$port" ] || { err "Порт панели не задан"; return 1; }
   local url="http://127.0.0.1:${port}${path}"
   if [ -n "$body" ]; then
-    resp=$(curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" -H 'Content-Type: application/json' -d "$body" "$url" 2>/dev/null)
+    resp=$(printf '%s' "$body" | curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" -H 'Content-Type: application/json' --data @- "$url" 2>/dev/null)
   else
     resp=$(curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" "$url" 2>/dev/null)
   fi
   if ! printf '%s' "$resp" | jq -e 'has("success")' >/dev/null 2>&1; then
     panel_login || { err "Панель недоступна (нет ответа/не удалось войти)"; printf ''; return 1; }
     if [ -n "$body" ]; then
-      resp=$(curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" -H 'Content-Type: application/json' -d "$body" "$url" 2>/dev/null)
+      resp=$(printf '%s' "$body" | curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" -H 'Content-Type: application/json' --data @- "$url" 2>/dev/null)
     else
       resp=$(curl -s --noproxy '*' -m 20 -b "$PANEL_COOKIE" -X "$method" "$url" 2>/dev/null)
     fi
@@ -859,8 +864,15 @@ build_group_config() {
   }' > "$tmpd/main_in"
 
   # правило группы: вход -> активная нода (или block, если активной нет)
+  # №3 (аудит №1): ACTIVE_<g> может указывать на УДАЛЁННУЮ ноду — раньше
+  # собирали правило на несуществующий out-тег и получали отказ apply без
+  # понятной причины. Ноды нет — честно уводим группу в block
   local out_tag="block"
-  [ -n "$active" ] && out_tag="out-${active}"
+  if [ -n "$active" ] && [ -f "$XMESH_NODES_DIR/$active.json" ]; then
+    out_tag="out-${active}"
+  elif [ -n "$active" ]; then
+    warn "ACTIVE_${g}=${active} не найдена в реестре — правило in-${g} -> block"
+  fi
   jq -n --arg tag "in-${g}" --arg out "$out_tag" \
     '{inboundTag: [$tag], outboundTag: $out}' > "$tmpd/rule.main"
 
@@ -923,6 +935,9 @@ group_rebuild() { group_apply "$1" "__auto__"; }
 
 #=========================== SYSTEMD-ЮНИТ РОУТЕРА =============================
 install_router_unit() {
+  # №23 (аудит №1): юнит перезаписывается без вопросов — сохраняем прежнюю версию
+  [ -f /etc/systemd/system/xmesh@.service ] \
+    && cp -f /etc/systemd/system/xmesh@.service "/etc/systemd/system/xmesh@.service.bak.$(date +%s)" 2>/dev/null || true
   cat > /etc/systemd/system/xmesh@.service <<'EOF'
 [Unit]
 Description=XMesh Router (%i)
@@ -1137,7 +1152,8 @@ build_sub() {  # <email>
   fi
   printf '%s\n' "${links[@]}" | base64 -w0 > "${XMESH_SUBS_DIR}/${token}.new"
   mv "${XMESH_SUBS_DIR}/${token}.new" "${XMESH_SUBS_DIR}/${token}"
-  chmod 644 "${XMESH_SUBS_DIR}/${token}"
+  chmod 640 "${XMESH_SUBS_DIR}/${token}"   # S-04: читать — только nginx
+  chgrp www-data "${XMESH_SUBS_DIR}/${token}" 2>/dev/null || true
   ok "Подписка обновлена: https://$(env_get MASTER_HOST)/sub/${token}  (${#links[@]} ссылок)"
   return 0
 }
@@ -1204,17 +1220,41 @@ ssh_key_ensure() {
   printf '%s' "$key"
 }
 
+# V-05 (аудит №2): TOFU-подтверждение отпечатка ДО первого соединения; пароль
+# на ноду не уезжает, пока человек не сверил отпечаток (или XMESH_YES=1)
+v3_ssh_host_key() { # $1 host, $2 port -> 0 = можно подключаться
+  local host="$1" port="$2" kh="$XMESH_SSH_DIR/known_hosts" scan fp a
+  mkdir -p "$XMESH_SSH_DIR" 2>/dev/null || true
+  ssh-keygen -F "[${host}]:${port}" -f "$kh" >/dev/null 2>&1 && return 0
+  ssh-keygen -F "${host}" -f "$kh" >/dev/null 2>&1 && return 0
+  scan="$(timeout 15 ssh-keyscan -T 8 -p "$port" "$host" 2>/dev/null)" || scan=""
+  [ -n "$scan" ] || { err "Не удалось снять отпечаток ключа ${host}:${port} (V-05)"; return 1; }
+  fp="$(printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | head -n1 | awk '{print $2, $4}')"
+  warn "Первое подключение к ${host}:${port}; отпечаток ключа: ${fp:-?}"
+  if [ "${XMESH_YES:-${XKIT_YES:-0}}" = "1" ]; then
+    warn "Принимаю без подтверждения (YES; TOFU — сверьте с консолью провайдера)"
+  else
+    read -r -p "Совпадает с консолью провайдера? [y/N]: " a || a=""
+    case "$a" in y|Y|yes|Yes) ;; *) return 1 ;; esac
+  fi
+  printf '%s\n' "$scan" >> "$kh"
+  return 0
+}
+
 ssh_run() {  # <key> <port> <user> <host> <command...>   (SSH_TIMEOUT — лимит, сек)
   local key="$1" port="$2" user="$3" host="$4"
   shift 4
+  v3_ssh_host_key "$host" "$port" || { err "Ключ хоста ${host}:${port} не подтверждён (V-05)"; return 1; }
   timeout "${SSH_TIMEOUT:-300}" ssh -i "$key" -p "$port" -o BatchMode=yes -o ConnectTimeout=12 \
-      -o StrictHostKeyChecking=accept-new "${user}@${host}" "$@"
+      -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$XMESH_SSH_DIR/known_hosts" "${user}@${host}" "$@"
 }
 
 ssh_deploy_key() {  # <port> <user> <host> <password> <key>
   local port="$1" user="$2" host="$3" pw="$4" key="$5"
+  # V-05: пароль отправляем только ПОСЛЕ подтверждения ключа хоста
+  v3_ssh_host_key "$host" "$port" || { err "Ключ хоста не подтверждён — пароль не отправляю (V-05)"; return 1; }
   SSHPASS="$pw" sshpass -e ssh-copy-id -i "${key}.pub" -p "$port" \
-    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$XMESH_SSH_DIR/known_hosts" -o ConnectTimeout=12 \
     -o PreferredAuthentications=password -o PubkeyAuthentication=no \
     "${user}@${host}" >/dev/null 2>&1
 }
@@ -1351,7 +1391,10 @@ node_add() {  # [группа] — если передана, вопрос о г
   pbk=$(jq -r '.pubkey' <<<"$json")
   eip=$(jq -r '.exit_ip' <<<"$json")
   [ -n "$eip" ] && [ "$eip" != "null" ] && [ "$eip" != "" ] || eip="$host"
-  [ -n "$pbk" ] && [ "$pbk" != "null" ] || { err "Нода не вернула публичный ключ"; return 1; }
+  # S-05/№10: ответ ноды не доверяем — битый eip/pbk не должен ломать JSON реестра
+  is_ip "$eip" || eip="$host"
+  [[ "$pbk" =~ ^[A-Za-z0-9_-]{42,44}$ ]] \
+    || { err "Нода вернула некорректный публичный ключ (${pbk:0:12}…) — отмена"; return 1; }
 
   printf '{\n  "name": "%s",\n  "group": "%s",\n  "host": "%s",\n  "ssh_port": %s,\n  "ssh_user": "%s",\n  "port": %s,\n  "uuid": "%s",\n  "pubkey": "%s",\n  "short_id": "%s",\n  "sni": "%s",\n  "exit_ip": "%s",\n  "probe_port": %s,\n  "created": "%s"\n}\n' \
     "$name" "$grp" "$host" "$sshport" "$sshuser" "$nport" "$uuid" "$pbk" "$sid" "$sni" "$eip" "$probe_port" \
@@ -1822,9 +1865,21 @@ install_3xui() {
   warn "Будет скачан и запущен ОФИЦИАЛЬНЫЙ установщик 3X-UI (github.com/MHSanaei/3x-ui)."
   read -r -p "Продолжить установку 3X-UI? [Y/n]: " a || { echo; return 1; }
   if [[ "$a" =~ ^[Nn] ]]; then log "Пропущено"; return 1; fi
-  local dl; dl="$(mktemp /tmp/xmesh-3xui.XXXXXX)" || { err "mktemp не удался"; return 1; }
-  curl -fsSL -o "$dl" https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
+  local dl tag url
+  # K-02 (аудит №2): тег последнего релиза вместо плавающего master
+  tag="$(curl -fsSL --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null \
+    | jq -r '.tag_name // ""' 2>/dev/null || true)"
+  if [[ "$tag" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
+    url="https://raw.githubusercontent.com/mhsanaei/3x-ui/${tag}/install.sh"
+    log "Установщик 3X-UI: релиз ${tag} (не master — K-02)"
+  else
+    warn "Не удалось определить тег релиза 3X-UI — качаю master"
+    url="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+  fi
+  dl="$(mktemp /tmp/xmesh-3xui.XXXXXX)" || { err "mktemp не удался"; return 1; }
+  curl -fsSL -o "$dl" "$url" \
     || { err "Не удалось скачать установщик 3X-UI (проверьте сеть)"; rm -f "$dl"; return 1; }
+  bash -n "$dl" || { err "Установщик 3X-UI не проходит bash -n — отмена (K-02)"; rm -f "$dl"; return 1; }
   # NOTE (аудит №8): XUI_NONINTERACTIVE=1 здесь НЕ ставим, в отличие от xkit.sh —
   # осознанно: пользователь вводит креды руками и затем дублирует их в env
   # (panel_creds_dialog); принудительный режим сломал бы этот диалог
@@ -1921,13 +1976,17 @@ full_install() {
     ok "UFW: 80/443 открыты"
   fi
   log "Проверяю nginx..."
-  if nginx -t 2>/tmp/.xmesh_nginx_t; then
+  local ngt; ngt="$(mktemp /tmp/.xmesh-nginx-t.XXXXXX)" || ngt=""   # V-04: не фиксированный путь в /tmp
+  if [ -n "$ngt" ] && nginx -t 2>"$ngt"; then
+    rm -f "$ngt"
     systemctl restart nginx && ok "Nginx работает"
     # дефолтный сайт сносим только когда наш конфиг точно работает:
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default 2>/dev/null
     systemctl reload nginx 2>/dev/null || true
   else
-    err "nginx -t не прошёл:"; sed 's/^/    /' /tmp/.xmesh_nginx_t >&2; return 1
+    err "nginx -t не прошёл:"; [ -n "$ngt" ] && sed 's/^/    /' "$ngt" >&2
+    [ -n "$ngt" ] && rm -f "$ngt"
+    return 1
   fi
 
   # панель
@@ -2134,10 +2193,22 @@ backup_restore() {
     err "Архив содержит небезопасные пути (../ или абсолютные) — восстановление отменено"
     return 1
   fi
-  # --no-same-owner/--no-overwrite-dir (ревью v3.2): не тащим из архива
-  # владельцев файлов и права СУЩЕСТВУЮЩИХ каталогов — symlink-атаку это не
-  # закрывает полностью, но поверхность заметно сужает
-  tar xzf "$f" -C / --no-same-owner --no-overwrite-dir
+  # №15 (аудит №1): symlink-члены не должны указывать НАРУЖУ. Легитимные
+  # внутренние ссылки letsencrypt (live -> archive, оба в архиве) — остаются
+  local rst; rst="$(mktemp -d /tmp/xmesh-restore.XXXXXX)" || { err "mktemp не удался"; return 1; }
+  if ! tar xzf "$f" -C "$rst" --no-same-owner; then
+    err "Архив битый"; rm -rf "$rst"; return 1
+  fi
+  esc="$(find "$rst" -type l 2>/dev/null | while read -r l; do
+    lt="$(readlink -f "$l" 2>/dev/null || true)"
+    case "$lt" in "$rst"|"$rst"/*) ;; *) echo "$l"; break ;; esac
+  done)"
+  if [ -n "$esc" ]; then
+    err "Архив содержит symlink наружу (${esc#"$rst"/}) — восстановление отменено (№15)"
+    rm -rf "$rst"; return 1
+  fi
+  cp -a "$rst"/. / || { err "Не удалось перенести файлы из временного каталога"; rm -rf "$rst"; return 1; }
+  rm -rf "$rst"
   systemctl daemon-reload 2>/dev/null || true
   systemctl restart nginx 2>/dev/null || true
   systemctl restart x-ui 2>/dev/null || true

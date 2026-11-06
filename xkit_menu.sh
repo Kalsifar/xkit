@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — МОДУЛЬ МЕНЮ (UI-слой), v5.0.0
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v5.2.0
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды, дашборд) не раздувается, а правки меню не трогают xkit.sh.
@@ -23,7 +23,7 @@ fi
 pause_enter() { echo ""; read -r -p "Нажмите Enter для возврата в меню..." _; }
 
 #=========================== ГЛАВНОЕ МЕНЮ =====================================
-# v5.0.0: плоский список из 26 пунктов собран в 6 групп-подменю — управление
+# v5.0.0: плоский список из 26 пунктов (в v5.1.0 — фрагмент без изменений) собран в 6 групп-подменю — управление
 # пользователями (было 4/5/6/20) теперь в одном месте, главное меню помещается
 # в один экран
 show_menu() {
@@ -36,7 +36,7 @@ show_menu() {
   echo -e "${GREEN}============================================================${NC}"
   echo -e "${YELLOW} 1)${NC} Установка и настройка (3X-UI, автопроброс, relay)"
   echo -e "${YELLOW} 2)${NC} ПОЛЬЗОВАТЕЛИ: создать / удалить / список / трафик / подписки"
-  echo -e "${YELLOW} 3)${NC} Reality: inbound / скан / ключи"
+  echo -e "${YELLOW} 3)${NC} Протоколы: REALITY / XHTTP / AmneziaWG / Hysteria 2"
   echo -e "${YELLOW} 4)${NC} НОДЫ: пул серверов, туннели, балансировка"
   echo -e "${YELLOW} 5)${NC} Обслуживание: сертификат, health, статус, бэкап, обновление"
   echo -e "${YELLOW} 6)${NC} Мониторинг: дашборд, Telegram, аренда, SSH-хук, реквизиты"
@@ -111,21 +111,29 @@ menu_users() {
   done
 }
 
-#=========================== 3. REALITY =======================================
+#=========================== 3. ПРОТОКОЛЫ =====================================
 menu_reality() {
   while true; do
     echo ""
-    echo -e "${YELLOW}=== REALITY: маскировка под чужой сайт ===${NC}"
-    echo " 1) Создать inbound (свой сайт / скан / известные / вручную)"
-    echo " 2) Скан подсети — найти dest-кандидаты"
-    echo " 3) Показать ключи и ссылки"
+    echo -e "${YELLOW}=== ПРОТОКОЛЫ И ПОДКЛЮЧЕНИЯ ===${NC}"
+    echo " 1) VLESS + REALITY + Vision: создать inbound"
+    echo " 2) VLESS + XHTTP + REALITY: создать inbound"
+    echo " 3) REALITY: скан подсети"
+    echo " 4) REALITY: показать ключи и ссылки"
+    echo " 5) AmneziaWG: служба и клиенты"
+    echo " 6) Hysteria 2: служба и ссылка"
+    echo " 7) Сводка всех профилей"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
     case "$c" in
       1) reality_wizard; pause_enter ;;
-      2) reality_scan_menu; pause_enter ;;
-      3) reality_show_keys; pause_enter ;;
+      2) xkit_protocols_load && proto_xhttp_create; pause_enter ;;
+      3) reality_scan_menu; pause_enter ;;
+      4) reality_show_keys; pause_enter ;;
+      5) xkit_protocols_load && proto_awg_menu; pause_enter ;;
+      6) xkit_protocols_load && proto_hy2_menu; pause_enter ;;
+      7) xkit_protocols_load && protocols_list; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac

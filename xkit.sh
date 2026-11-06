@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v4.9.1 — «кит-меню» для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v5.2.0 — TUI + профили доступа для nginx + 3X-UI (Ubuntu 24.04+)
 #  Похож на родное меню x-ui: зашёл по SSH — меню само (или наберите `xkit`).
 #
 #  ГЛАВНОЕ:
@@ -177,6 +177,53 @@
 #     дублируется; notify_state_set пишет в subshell (umask не утекает при
 #     сбоях), xui_env_val парсит awk'ом (ключ с метасимволами безопасен)
 #
+#  НОВОЕ В v5.2.0 (TUI + протоколы):
+#   • отдельный полноэкранный TUI (Go/Bubble Tea), amd64/arm64; стрелки, поиск,
+#     живой snapshot, запуск штатных CLI-команд; XKIT_TUI=0 и xkit --classic —
+#     прежнее Bash-меню, pipe/cron автоматически используют fallback
+#   • xkit protocols: VLESS+REALITY+Vision, новый VLESS+XHTTP+REALITY,
+#     AmneziaWG и Hysteria 2 как отдельные systemd-службы; list/status --json
+#   • Hysteria 2: официальный release asset + hashes.txt, SHA-256 обязателен;
+#     Salamander, клиентская hy2://-ссылка, UFW и безопасные права
+#   • AmneziaWG: официальный PPA, отдельные клиентские конфиги 600, стабильный
+#     J/S/H-профиль без экспериментальных I1-I5; peer apply с откатом
+#   • xkit snapshot — санитизированный JSON для TUI (без ключей и паролей)
+#
+#  НОВОЕ В v5.1.0 (security-релиз: подтверждённое из аудита №1 + P0/P1 аудита №2):
+#   • K-01 КРИТИЧНО: nginx-конфиг собирается ТОЛЬКО из провалидированных значений:
+#     is_nginx_path (запрет ~, .., //, *) для путей, строгий parse_hostport
+#     ([v6]:port; заодно чинит IPv6-таргеты/F-3), is_port для PANEL_PORT.
+#     Невалидное = отказ маршрута, а не «нормализация»
+#   • K-02 КРИТИЧНО: supply chain fail-closed — без xkit.sh.sha256 установка
+#     (install.sh) и обновление (xkit update/докачка меню) ОТМЕНЯЮТСЯ;
+#     осознанный обход: XKIT_ALLOW_UNVERIFIED=1. http://-источники наружу
+#     запрещены (localhost-зеркала — можно). Установщик 3X-UI — по тегу
+#     последнего релиза (не master) + bash -n скачанного
+#   • V-01: TARGETS уходит на ноду base64'ом (вне shell-строки) + валидация
+#     токенов в reality_expand_targets
+#   • V-02: меню грузится только из доверенных мест (root-владелец, без
+#     group/world-write; /tmp, /var/tmp, /dev/shm — чёрный список)
+#   • V-03: секреты ушли из argv: логин панели и node_api через --data @-
+#     (stdin), nodes.json в python3 через tmpfile 600, openssl passwd -stdin
+#   • V-05: SSH TOFU с подтверждением — отпечаток ключа ноды показывается и
+#     подтверждается ДО первой отправки пароля (node_ssh_host_key)
+#   • V-06: восстановление бэкапа — проверка членов tar, symlink'ов наружу и
+#     командных подстановок в xkit.env; чужой архив — только через YES
+#   • S-03: порт SSH из sshd -T/sshd_config; не определили — UFW не включаем
+#   • v3: mktemp вместо /tmp/.xmesh_nginx_t (V-04); exit_ip/pbk ноды
+#     валидируются (S-05/№10); ACTIVE на удалённой ноде -> block (№3);
+#     бэкап юнита (№23); symlink-члены tar при restore (№15); подписки
+#     750/640 (S-04); пароли панели нод через stdin (V-03); TOFU-подтверждение
+#     при установке ключа (V-05); 3X-UI на ноде по тегу (K-02)
+#   • дашборд: смешанный формат stale-данных больше не теряет пользователей (№1);
+#     ротация отменяется при неудачном бэкапе htpasswd (№4); is_ipv6 без
+#     python3 — через getent (№7/N-04)
+#   • мелочи: api_del_inbound вместо сырого del/ (№2), валидация TG-токена из
+#     env (№9), tonumber в client_list (№12), warn при нестандартном hosts/list
+#     (№18), dirname вместо %/* (№19), ранний фолбэк XKIT_REPO_URL (№22),
+#     ::ffff:127.0.0.1 в проверке «светится наружу» (№24), честные rc у
+#     xkit_menu_fetch/install (F-1/F-2)
+#
 #  НОВОЕ В v5.0.0 (модульное меню):
 #   • МЕНЮ ПЕРЕРАБОТАНО: плоский список из 26 пунктов собран в 6 групп с
 #     подменю — 1) Установка и настройка 2) ПОЛЬЗОВАТЕЛИ (создать/удалить/
@@ -291,7 +338,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="5.0.0"
+XKIT_VERSION="5.2.0"
 # TTY-детект (ревью v4.7.0): при не-терминале (curl|bash, cron, tee, CI) цвета
 # гаснут — в логах не остаётся сырых \033[… кодов. XKIT_NO_COLOR=1 — ручной
 # override; XKIT_NO_ANIM=1 отключает спиннер при живом TTY
@@ -417,6 +464,22 @@ xkit_log_begin() { # $1 = префикс имени (install|reinstall|uninstall
 
 CERTBOT_MIN_IP="5.3"                 # certbot для --ip-address
 XUI_INSTALLER_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+
+# K-02 (аудит №2): установщик 3X-UI — по тегу ПОСЛЕДНЕГО РЕЛИЗА (master плавает
+# и может измениться в любой момент). Переопределить: XKIT_3XUI_TAG=vX.Y.Z
+xui_install_url() {
+  local tag="${XKIT_3XUI_TAG:-}"
+  if [ -z "$tag" ]; then
+    tag="$(curl -fsSL --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null \
+      | jq -r '.tag_name // ""' 2>/dev/null || true)"
+  fi
+  if [[ "$tag" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
+    printf 'https://raw.githubusercontent.com/mhsanaei/3x-ui/%s/install.sh' "$tag"
+  else
+    warn "Не удалось определить тег релиза 3X-UI — качаю master (зафиксируйте: XKIT_3XUI_TAG=vX.Y.Z)" >&2
+    printf '%s' "$XUI_INSTALLER_URL"
+  fi
+}
 XKIT_DIR="/etc/xkit"
 XKIT_ENV="${XKIT_DIR}/xkit.env"
 XKIT_ROUTES="${XKIT_DIR}/routes.tsv"
@@ -427,7 +490,9 @@ XKIT_DASH_HTPASSWD="/etc/nginx/.xkit-dash.htpasswd"  # Basic Auth дашборд
 XKIT_INFO_FILE="/root/xkit-info.txt"      # сводка-реквизиты (терминал + файл)
 XKIT_NOTIFY_STATE="${XKIT_DIR}/notify.state"  # состояние Telegram-алертов (гистерезис/дедуп)
 XKIT_BIN="/usr/local/bin/xkit"
-XKIT_MENU_DIR="${XKIT_MENU_DIR:-/usr/local/lib/xkit}"  # модуль меню (xkit_menu.sh), v5.0.0
+XKIT_MENU_DIR="${XKIT_MENU_DIR:-/usr/local/lib/xkit}"  # модули XKIT
+XKIT_PROTOCOLS_FILE="${XKIT_PROTOCOLS_FILE:-${XKIT_MENU_DIR}/xkit_protocols.sh}"
+XKIT_TUI_FILE="${XKIT_TUI_FILE:-${XKIT_MENU_DIR}/xkit-tui}"
 SUBS_DIR="/var/lib/xkit/subs"
 BACKUP_DIR="/var/backups/xkit"
 # cron-файлы кита — переменные (не хардкод), чтобы uninstall и тесты работали
@@ -461,7 +526,9 @@ is_ipv6() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import socket,sys; socket.inet_pton(socket.AF_INET6, sys.argv[1])' "$1" >/dev/null 2>&1
   else
-    [[ "$1" != *::*::* ]]
+    # №7 (аудит №1)/N-04 (№2): getent резолвит литерал ТОЛЬКО если это валидный
+    # адрес (charset уже ограничен [0-9a-fA-F:] — DNS-имя сюда попасть не может)
+    getent ahosts "$1" >/dev/null 2>&1
   fi
 }
 
@@ -479,9 +546,44 @@ is_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; 
 
 is_path() { [[ "$1" =~ ^/[A-Za-z0-9._~/-]*$ ]] && [[ "$1" != *"//"* ]]; }
 
+# Строгий location-путь для генерации nginx (K-01, аудит №2): панель/инбаунд/
+# routes.tsv не должны уметь вставить директивы. Запрещены ~ (regex-маркер
+# location), .. (alias-эскапада), // и * (модификатор location)
+is_nginx_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]*$ ]] || return 1
+  [[ "$1" != *"//"* && "$1" != *".."* && "$1" != *"~"* && "$1" != *"*"* ]]
+}
+
+# host:port / [v6]:port -> R_HOST/R_PORT (K-01; заодно F-3: IPv6-таргет
+# раньше ломал domain_only="${target%%:*}" -> "[2001")
+parse_hostport() {
+  local s="$1"
+  R_HOST=""; R_PORT=""
+  case "$s" in
+    \[*\]:*)
+      R_HOST="${s%%]:*}"; R_HOST="${R_HOST#\[}"
+      R_PORT="${s##*]:}"
+      ;;
+    *:*)
+      [[ "$s" == *:*:* ]] && return 1   # голый IPv6 (несколько :) — только в скобках
+      R_HOST="${s%%:*}"; R_PORT="${s##*:}"
+      ;;
+    *) return 1 ;;
+  esac
+  is_port "$R_PORT" || return 1
+  case "$s" in
+    \[*) is_ipv6 "$R_HOST" || return 1 ;;
+    *)   is_ipv4 "$R_HOST" || is_hostname "$R_HOST" || return 1 ;;
+  esac
+  return 0
+}
+
 safe_conf_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 
 is_email() { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
+
+# одно-меточное имя хоста без точки (localhost, relay-алиасы) — is_domain требует точку
+is_hostname() { is_domain "$1" || [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; }
 
 # СНАЧАЛА IP, потом домен: "1.2.3.4" проходит и доменную регулярку!
 host_kind() { if is_ip "$1"; then echo "ip"; elif is_domain "$1"; then echo "domain"; else echo "bad"; fi }
@@ -862,6 +964,17 @@ choose_certificate() {
 generate_location_block() {
   local trans_type="$1" path_name="$2" target="$3" is_local="$4"
   local block="" domain_only=""
+  # K-01 (аудит №2): в конфиг попадают ТОЛЬКО провалидированные значения.
+  # Мусорный путь/таргет из панели/routes.tsv = отказ маршрута (пустой вывод
+  # + сообщение в stderr), а не «нормализация»
+  if ! is_nginx_path "$path_name"; then
+    err "K-01: подозрительный путь «${path_name:0:60}» — маршрут НЕ добавлен в конфиг nginx"
+    return 1
+  fi
+  if ! parse_hostport "$target"; then
+    err "K-01: подозрительный таргет «${target:0:60}» — маршрут НЕ добавлен в конфиг nginx"
+    return 1
+  fi
 
   if [ "$trans_type" == "1" ]; then
     # === gRPC ===
@@ -881,7 +994,7 @@ BLK
       block+="        grpc_pass grpc://${target};
 "
     else
-      domain_only="${target%%:*}"
+      domain_only="$R_HOST"
       block+="        grpc_pass grpcs://${target};
         grpc_ssl_server_name on;
         grpc_ssl_name ${domain_only};
@@ -912,7 +1025,7 @@ BLK
         proxy_set_header Host \$host;
 "
     else
-      domain_only="${target%%:*}"
+      domain_only="$R_HOST"
       block+="        proxy_pass https://${target};
         proxy_ssl_server_name on;
         proxy_ssl_name ${domain_only};
@@ -943,7 +1056,7 @@ BLK
         proxy_set_header Host \$host;
 "
     else
-      domain_only="${target%%:*}"
+      domain_only="$R_HOST"
       block+="        proxy_pass https://${target};
         proxy_ssl_server_name on;
         proxy_ssl_name ${domain_only};
@@ -974,7 +1087,7 @@ BLK
         proxy_set_header Host \$host;
 "
     else
-      domain_only="${target%%:*}"
+      domain_only="$R_HOST"
       block+="        proxy_pass https://${target};
         proxy_ssl_server_name on;
         proxy_ssl_name ${domain_only};
@@ -992,6 +1105,11 @@ generate_web_proxy_block() {
   local label="$1" path_name="$2" target="$3" scheme="$4"
   local proto="http"
   [ "$scheme" = "https" ] && proto="https"
+  # K-01 (аудит №2): те же гарантии для панели/подписок
+  if ! is_nginx_path "$path_name" || ! parse_hostport "$target"; then
+    err "K-01: подозрительные путь/таргет (${label}) — блок НЕ добавлен в конфиг nginx"
+    return 1
+  fi
   cat <<BLK
 
     # --- ${label} (${path_name} -> ${target}) ---
@@ -1058,10 +1176,12 @@ install_3xui_auto() {
     warn "3X-UI уже установлен — использую текущие настройки"
     return 0
   fi
-  log "Скачиваю официальный установщик 3X-UI..."
+  log "Скачиваю официальный установщик 3X-UI (K-02: тег релиза, не master)..."
+  local u; u="$(xui_install_url)"
   local dl; dl="$(mktemp /tmp/xkit-3xui.XXXXXX)" || die "mktemp не удался"
-  curl -fsSL -o "$dl" "$XUI_INSTALLER_URL" \
+  curl -fsSL -o "$dl" "$u" \
     || { rm -f "$dl"; die "Не удалось скачать установщик 3X-UI (проверьте сеть)"; }
+  bash -n "$dl" || { rm -f "$dl"; die "Скачанный установщик 3X-UI не проходит bash -n — отмена (K-02)"; }
   log "Устанавливаю 3X-UI в неинтерактивном режиме (случайные креды)..."
   if ! XUI_NONINTERACTIVE=1 bash "$dl" </dev/null; then
     rm -f "$dl"
@@ -1108,7 +1228,9 @@ read_panel_settings() {
     fi
   fi
   [ -n "$PANEL_PORT" ] || { err "Не удалось определить порт панели 3X-UI"; return 1; }
+  is_port "$PANEL_PORT" || { err "K-01: порт панели некорректен: ${PANEL_PORT:0:20}"; return 1; }
   PANEL_WBP=$(normalize_panel_path "$PANEL_WBP")
+  is_nginx_path "$PANEL_WBP" || { err "K-01: webBasePath панели некорректен: ${PANEL_WBP:0:40}"; return 1; }
   return 0
 }
 
@@ -1193,7 +1315,7 @@ load_xkit_env() {
   XKIT_DASH_AUTH="1"; XKIT_DASH_USER=""; XKIT_DASH_PASS=""
   XKIT_TG_TOKEN=""; XKIT_TG_CHAT=""; XKIT_TG_PROXY=""
   local _repo="${XKIT_REPO_URL:-}"   # внешнее значение (от install.sh) не теряем
-  XKIT_REPO_URL=""
+  XKIT_REPO_URL="$_repo"             # №22: фолбэк ДО чтения env — ранний return не теряет
   [ -r "$XKIT_ENV" ] || return 1
   # shellcheck disable=SC1090
   . "$XKIT_ENV"
@@ -1286,11 +1408,13 @@ kit_login() {
   resp="$(mktemp /tmp/xkit-login.XXXXXX)"; chmod 600 "$resp"
   local -a h=()
   [ -n "$CSRF_TOKEN" ] && h+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  # V-03 (аудит №2): тело через stdin (--data @-) — пароль не светится в argv
+  local body
+  body="username=$(jq -rn --arg v "${PANEL_USER:-}" '$v|@uri')&password=$(jq -rn --arg v "${PANEL_PASS:-}" '$v|@uri')"
   rc=0
-  code="$(curl_panel --max-time 8 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+  code="$(printf '%s' "$body" | curl_panel --max-time 8 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -o "$resp" -w '%{http_code}' -X POST "${h[@]}" \
-    --data-urlencode "username=${PANEL_USER}" \
-    --data-urlencode "password=${PANEL_PASS}" "$url")" || rc=$?
+    -H 'Content-Type: application/x-www-form-urlencoded' --data @- "$url")" || rc=$?
   out="$(cat "$resp" 2>/dev/null || true)"; rm -f "$resp"
   if [ "$rc" -ne 0 ]; then
     err "Панель не отвечает (127.0.0.1:${PANEL_PORT}, curl exit ${rc}) — проверьте: systemctl status x-ui"
@@ -1481,7 +1605,7 @@ net_tag() { case "$1" in ws) echo ws ;; grpc) echo gr ;; xhttp|splithttp) echo x
 
 # текущий путь/имя сервиса инбаунда (то, что задано в streamSettings)
 inbound_path() { # $1 inbound JSON, $2 net (ws|grpc|xhttp|httpupgrade|tcp)
-  local s='.streamSettings|fromjson?'
+  local s='.streamSettings | if type=="string" then (fromjson? // {}) else (. // {}) end'
   case "$2" in
     ws)          jq -r "${s}|.wsSettings.path // \"\"" <<<"$1" ;;
     grpc)        jq -r "${s}|.grpcSettings.serviceName // \"\"" <<<"$1" ;;
@@ -1564,6 +1688,11 @@ auto_route() {
         continue
       fi
       case "$path" in /*) ;; *) path="/$path" ;; esac
+      if ! is_nginx_path "$path"; then
+        routes_del "$id"; direct=$((direct+1))
+        printf '%-4s %-16s %-9s %-6s %-8s %s\n' "$id" "${tag:0:16}" "$proto" "$port" "DIRECT" "путь tcp+http нестандартный — в nginx не добавляю (K-01)"
+        continue
+      fi
     else
       path="$(auto_path_for "$tag2" "$port")"
     fi
@@ -1803,7 +1932,14 @@ link_for_client() { # $1 inbound JSON, $2 client JSON (settings-объект)
       pbk="$(reality_pbk "$stream")"; sid="$(reality_sid "$stream")"; sni="$(reality_sni "$stream")"
       [ -n "$sni" ] || sni="$host"
     fi
-    _link_proto "$proto" "$email" "$host" "$port" "$net" "$sec" "" "" "${sni:-}" "$pbk" "$sid" "" "$flow" "$cl" "$ib"
+    # v5.2: direct XHTTP/WS/gRPC тоже нуждаются в path/serviceName; раньше
+    # direct-ветка всегда передавала пустые значения, и XHTTP-ссылка была неполной.
+    case "$net" in
+      ws|xhttp|splithttp|httpupgrade) path="$(inbound_path "$ib" "$net")" ;;
+      grpc) svc="$(inbound_path "$ib" grpc)" ;;
+      tcp) path="$(inbound_path "$ib" tcp)" ;;
+    esac
+    _link_proto "$proto" "$email" "$host" "$port" "$net" "$sec" "$path" "$svc" "${sni:-}" "$pbk" "$sid" "" "$flow" "$cl" "$ib"
   fi
 }
 
@@ -2118,11 +2254,11 @@ client_list() {
       local email subid totalgb exp up down
       email="$(jq -r '.email // "-"' <<<"$cl")"
       subid="$(jq -r '.subId // ""' <<<"$cl")"
-      totalgb="$(jq -r '.totalGB // 0' <<<"$cl")"
+      totalgb="$(jq -r '.totalGB // 0 | (tonumber? // 0)' <<<"$cl")"
       exp="$(jq -r '.expiryTime // 0' <<<"$cl")"
       up=0; down=0
-      up="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | .up] | add // 0' <<<"$ib" 2>/dev/null)"
-      down="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | .down] | add // 0' <<<"$ib" 2>/dev/null)"
+      up="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | (.up|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
+      down="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | (.down|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
       used="$(human_bytes $((up+down)))"
       printf '   %-26s %-12s %-10s %-11s %s\n' "${email:0:26}" \
         "$([ "${totalgb:-0}" -gt 0 ] 2>/dev/null && human_bytes "$totalgb" || echo "∞")" \
@@ -2185,7 +2321,7 @@ health_check() {
     if [ "$code" != "000" ]; then okln "панель отвечает через nginx (HTTP $code): https://${XKIT_HOST}${PANEL_WBP}"
     else badln "панель недоступна через nginx (${PANEL_WBP})"; fi
     # не слушает ли панель снаружи
-    if ss -ltnH 2>/dev/null | awk -v p=":${PANEL_PORT} " 'index($4,p) && $4 !~ /^(127\.0\.0\.1|\[::1\])/' | grep -q .; then
+    if ss -ltnH 2>/dev/null | awk -v p=":${PANEL_PORT} " 'index($4,p) && $4 !~ /^(127\.0\.0\.1|\[::1\]|\[::ffff:127\.0\.0\.1\])/' | grep -q .; then
       warnln "порт панели ${PANEL_PORT} слушает НЕ только 127.0.0.1! Выполните: ufw deny ${PANEL_PORT}/tcp"
     else
       okln "порт панели ${PANEL_PORT} наружу не светится (только 127.0.0.1)"
@@ -2287,6 +2423,10 @@ backup_now() {
   [ -f "$XUI_DB" ] && paths+=("$XUI_DB")
   [ -d /etc/nginx/ssl ] && paths+=("/etc/nginx/ssl")
   [ -d /etc/letsencrypt ] && paths+=("/etc/letsencrypt")
+  # v5.2: отдельные службы протоколов тоже входят в аварийный архив.
+  [ -f /etc/amnezia/amneziawg/awg0.conf ] && grep -q '^# Managed by XKIT' /etc/amnezia/amneziawg/awg0.conf 2>/dev/null && paths+=("/etc/amnezia/amneziawg/awg0.conf")
+  [ -f /etc/systemd/system/xkit-hysteria2.service ] && paths+=("/etc/systemd/system/xkit-hysteria2.service")
+  [ -f /etc/sysctl.d/99-xkit-awg.conf ] && paths+=("/etc/sysctl.d/99-xkit-awg.conf")
   [ "${#paths[@]}" -eq 0 ] && { warn "Нечего бэкапить"; return 1; }
   # БД панели в PostgreSQL tar'ом не забрать — честно предупреждаем
   if [ -f "$XUI_RESULT" ] && grep -q "XUI_DB_TYPE=postgres" "$XUI_RESULT" 2>/dev/null; then
@@ -2316,9 +2456,41 @@ backup_restore() {
   local file="${1:-}"
   [ -z "$file" ] && file="$(ls -1t "$BACKUP_DIR"/xkit-*.tar.gz 2>/dev/null | head -n1)"
   [ -n "$file" ] && [ -f "$file" ] || die "Бэкапы не найдены в $BACKUP_DIR"
+  # V-06 (аудит №2): чужой бэкап = root RCE через содержимое. Вне BACKUP_DIR —
+  # только через явное YES (или XKIT_ALLOW_UNTRUSTED_BACKUP=1)
+  case "$(readlink -f -- "$file" 2>/dev/null || echo "$file")" in
+    "$BACKUP_DIR"/*) ;;
+    *)
+      if [ "${XKIT_ALLOW_UNTRUSTED_BACKUP:-0}" != "1" ]; then
+        warn "Файл вне ${BACKUP_DIR}: $(basename -- "$file")"
+        local a; read -r -p "Чужой бэкап может выполнить команды от root. Точно восстановить? Введите YES: " a || { echo; return 1; }
+        [ "$a" = "YES" ] || { log "Отменено"; return 0; }
+      fi
+      ;;
+  esac
   log "Восстанавливаю из: $file"
+  # V-06: члены архива — без ../ и абсолютных путей (проверка ДО распаковки)
+  if tar -tzf "$file" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+    err "Архив содержит небезопасные пути (../ или абсолютные) — восстановление отменено"
+    return 1
+  fi
   local t; t="$(mktemp -d)"
   tar xzf "$file" -C "$t" || { err "Архив битый"; rm -rf "$t"; return 1; }
+  # V-06: symlink-члены не должны указывать наружу (легитимные внутренние — можно)
+  local badlink
+  badlink="$(find "$t" -type l 2>/dev/null | while read -r l; do
+    lt="$(readlink -f "$l" 2>/dev/null || true)"
+    case "$lt" in "$t"|"$t"/*) ;; *) echo "$l"; break ;; esac
+  done)"
+  if [ -n "$badlink" ]; then
+    err "Архив содержит symlink наружу (${badlink#"$t"/}) — восстановление отменено (V-06)"
+    rm -rf "$t"; return 1
+  fi
+  # V-06: xkit.env из архива НЕ исполняем вслепую — командная подстановка = отказ
+  if [ -f "$t${XKIT_ENV}" ] && grep -qE '`|\$\(|\$\{' "$t${XKIT_ENV}" 2>/dev/null; then
+    err "xkit.env в архиве содержит командную подстановку — восстановление отменено (V-06)"
+    rm -rf "$t"; return 1
+  fi
 
   systemctl stop x-ui 2>/dev/null || true
   if [ -f "$t${XUI_DB}" ]; then
@@ -2338,7 +2510,15 @@ backup_restore() {
   if [ -d "$t$SUBS_DIR" ]; then
     cp -a "$t$SUBS_DIR/." "$SUBS_DIR/" 2>/dev/null && ok "Файлы подписок восстановлены"
   fi
+  # v5.2: конфиги отдельных протоколов; бинарники в tar не хранятся.
+  local rp
+  for rp in /etc/amnezia/amneziawg/awg0.conf /etc/systemd/system/xkit-hysteria2.service /etc/sysctl.d/99-xkit-awg.conf; do
+    if [ -f "$t$rp" ]; then mkdir -p "$(dirname "$rp")"; cp -f "$t$rp" "$rp"; fi
+  done
   rm -rf "$t"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  [ -f /etc/systemd/system/xkit-hysteria2.service ] && systemctl enable --now xkit-hysteria2 >/dev/null 2>&1 || true
+  [ -f /etc/amnezia/amneziawg/awg0.conf ] && systemctl enable --now awg-quick@awg0 >/dev/null 2>&1 || true
 
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
@@ -2406,16 +2586,31 @@ setup_ufw() {
   command -v ufw >/dev/null 2>&1 || { warn "ufw не найден — пропускаю настройку фаервола"; return 0; }
   if ufw status 2>/dev/null | head -n1 | grep -q "inactive"; then
     local ssh_port a
-    ssh_port=$(ss -tlnp 2>/dev/null | awk '/"sshd"/ {n=split($4,a,":"); print a[n]; exit}')
-    read -r -p "Включить ufw (наружу останутся только SSH ${ssh_port:-22}, 80, 443)? [Y/n]: " a
+    # S-03 (аудит №2): порт SSH из sshd -T/sshd_config, НЕ из ss-парсинга;
+    # не определили — UFW НЕ включаем (fallback на 22 = lockout при нестандартном порте)
+    ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+    [ -n "$ssh_port" ] || ssh_port="$(awk 'tolower($1)=="port"{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+    [ -n "$ssh_port" ] || ssh_port="$(ss -tlnp 2>/dev/null | awk '/"sshd"/ {n=split($4,a,":"); print a[n]; exit}')"
+    if [ -n "$ssh_port" ] && ! is_port "$ssh_port"; then ssh_port=""; fi
+    if [ -z "$ssh_port" ]; then
+      if [ -t 0 ]; then
+        read -r -p "Не смог определить порт SSH. Укажите его вручную (Enter — пропустить ufw): " ssh_port || ssh_port=""
+      fi
+      is_port "${ssh_port:-}" 2>/dev/null || ssh_port=""
+    fi
+    if [ -z "$ssh_port" ]; then
+      warn "Порт SSH не определён — UFW НЕ включаю (риск заблокировать себя). Вручную: ufw allow <порт>/tcp && ufw enable"
+      return 0
+    fi
+    read -r -p "Включить ufw (наружу останутся только SSH ${ssh_port}, 80, 443)? [Y/n]: " a || a=""
     if [[ "$a" =~ ^[Nn] ]]; then
       warn "UFW не включён — панель/инбаунды на 127.0.0.1 всё равно не видны, но проверьте открытые порты сами"
       return 0
     fi
-    if [ -n "$ssh_port" ]; then ufw allow "${ssh_port}/tcp" >/dev/null 2>&1; else ufw allow OpenSSH >/dev/null 2>&1; fi
+    ufw allow "${ssh_port}/tcp" >/dev/null 2>&1
     ufw allow 80/tcp  >/dev/null 2>&1
     ufw allow 443/tcp >/dev/null 2>&1
-    ufw --force enable >/dev/null 2>&1 && ok "UFW включён: наружу только SSH ${ssh_port:-22}, 80, 443"
+    ufw --force enable >/dev/null 2>&1 && ok "UFW включён: наружу только SSH ${ssh_port}, 80, 443"
     XKIT_UFW=1
   else
     ok "UFW уже активен"
@@ -2568,6 +2763,15 @@ xkit_uninstall() {
     ufw delete deny "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
   fi
 
+  # v5.2: отдельные службы протоколов. Чужой awg0 без метки XKIT не трогаем.
+  systemctl disable --now xkit-hysteria2 >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xkit-hysteria2.service /usr/local/bin/xkit-hysteria2
+  if [ -f /etc/amnezia/amneziawg/awg0.conf ] && grep -q '^# Managed by XKIT' /etc/amnezia/amneziawg/awg0.conf 2>/dev/null; then
+    systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true
+    rm -f /etc/amnezia/amneziawg/awg0.conf /etc/sysctl.d/99-xkit-awg.conf
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   # файлы состояния: /etc/xkit, подписки, дашборд и стандартная база /var/lib/xkit
   # (SUBS_DIR/XKIT_DASH_DIR — переменные, удаляем явно; /var/lib/xkit — база по
   # умолчанию, сносит остатки старых версий, если пути переопределены)
@@ -2705,6 +2909,7 @@ one_step_install() {
       && ok "Меню установлено: введите в SSH команду xkit"
   fi
   xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
+  xkit_extras_install || warn "TUI/модуль протоколов не установлен — выполните xkit update"
 
   echo ""
   echo -e "${GREEN}============================================================${NC}"
@@ -2782,6 +2987,7 @@ hide_existing_panel() {
   save_xkit_env
   if [ -f "$0" ]; then cp -f "$(readlink -f "$0")" "$XKIT_BIN" && chmod 700 "$XKIT_BIN"; fi
   xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
+  xkit_extras_install || warn "TUI/модуль протоколов не установлен — выполните xkit update"
   ok "Панель доступна ТОЛЬКО через: https://${XKIT_HOST}${PANEL_WBP}"
   log "Дальше: инбаунды с Listen IP = 127.0.0.1, затем пункт 2 (автопроброс)"
   xkit_summary_save >/dev/null 2>&1 || true
@@ -2813,6 +3019,11 @@ v3_host_upsert() { # $1 id инбаунда, $2 адрес, $3 порт, $4 secu
   body="$(jq -nc --argjson ids "[${id}]" --arg a "$addr" --argjson p "$eport" --arg s "$sec" \
     '{inboundIds:$ids, remark:"xkit", hosts:[$a], port:$p, security:$s}')"
   resp="$(api_get_raw "panel/api/hosts/list" 2>/dev/null || true)"
+  # №18 (аудит №1): нестандартный ответ (строка/массив вместо объекта) —
+  # поиск groupId молча не найдёт группу => hosts/add создаст ДУБЛЬ. Честно предупредить
+  if [ -n "$resp" ] && ! jq -e 'type=="object"' <<<"$resp" >/dev/null 2>&1; then
+    warn "hosts/list: нестандартный ответ панели — возможен дубль host-группы (проверьте панель)"
+  fi
   gid="$(jq -r --argjson id "$id" \
     '[.obj[]? | select(((.inboundIds // []) | index($id)) and ((.remark // "") == "xkit"))][0].groupId // empty' \
     <<<"$resp" 2>/dev/null || true)"
@@ -2924,9 +3135,10 @@ ensure_panel_sub_settings() {
   [ -n "${XKIT_PANEL_SUB_PORT:-}" ] || XKIT_PANEL_SUB_PORT="$(rand_free_port 30000 50000)" \
     || { err "Нет свободного порта для подписок"; return 1; }
   if [ -z "${XKIT_PANEL_SUB_PATH:-}" ]; then
-    if [ -n "$cur_path" ] && [[ "$cur_path" == /* ]]; then
+    if [ -n "$cur_path" ] && is_nginx_path "$(normalize_panel_path "$cur_path")"; then
       XKIT_PANEL_SUB_PATH="$(normalize_panel_path "$cur_path")"
     else
+      [ -n "$cur_path" ] && warn "subPath панели «${cur_path:0:40}» нестандартный — генерирую свой (K-01)"
       XKIT_PANEL_SUB_PATH="/sub-${XKIT_SUB_TOKEN:-$(rand_str 8)}/"
     fi
   fi
@@ -3042,7 +3254,7 @@ HTML
 reality_expand_targets() { # CIDR (/24 и меньше) или список -> по IP в строке
   command -v python3 >/dev/null 2>&1 || { err "python3 не найден — выполните: apt-get install -y python3"; echo "ERR:python3 не найден"; return 1; }
   python3 - "$1" <<'PY'
-import sys, ipaddress
+import sys, ipaddress, re
 arg = sys.argv[1]
 if "/" in arg:
     try:
@@ -3055,6 +3267,10 @@ if "/" in arg:
         print(str(ip))
 else:
     for h in arg.split():
+        # V-01 (аудит №2): токен уходит в SSH-сессию — валидируем charset,
+        # кавычка/;/$ не имеют права доехать до bash ноды
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]+", h):
+            print("ERR:bad-target"); sys.exit(0)
         print(h)
 PY
 }
@@ -3350,6 +3566,10 @@ node_ssh() { # $1 rec-json, остальные — команда на ноде
   # постоянный known_hosts: первый коннект TOFU (accept-new), дальше — жёсткая проверка ключа
   local kh="${XKIT_DIR}/known_hosts"
   mkdir -p "$XKIT_DIR" 2>/dev/null || true; touch "$kh" 2>/dev/null || true; chmod 600 "$kh" 2>/dev/null || true
+  # V-05 (аудит №2): отпечаток показывается и подтверждается ДО первого
+  # коннекта — при парольной аутентификации sshpass отправляет пароль сразу
+  node_ssh_host_key "$host" "$port" "$kh" \
+    || { err "Ключ хоста ${host}:${port} не подтверждён — подключение отменено (V-05)"; return 1; }
   local -a a=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kh" -o ConnectTimeout=10 -p "$port")
   if [ "$auth" = "password" ]; then
     command -v sshpass >/dev/null 2>&1 || { err "sshpass не найден (apt install sshpass)"; return 1; }
@@ -3357,6 +3577,26 @@ node_ssh() { # $1 rec-json, остальные — команда на ноде
   else
     ssh -i "$key" -o BatchMode=yes "${a[@]}" "${user}@${host}" "$@"
   fi
+}
+
+# узел-TOFU (V-05): снимаем ключ через keyscan, показываем отпечаток, ждём
+# подтверждения ДО того, как что-то (тем более пароль) уедет на ноду
+node_ssh_host_key() { # $1 host, $2 port, $3 known_hosts -> 0 = можно подключаться
+  local host="$1" port="$2" kh="$3" scan fp a
+  ssh-keygen -F "[${host}]:${port}" -f "$kh" >/dev/null 2>&1 && return 0
+  ssh-keygen -F "${host}" -f "$kh" >/dev/null 2>&1 && return 0
+  scan="$(timeout 15 ssh-keyscan -T 8 -p "$port" "$host" 2>/dev/null)" || scan=""
+  [ -n "$scan" ] || { err "Не удалось снять отпечаток ключа ${host}:${port} (V-05)"; return 1; }
+  fp="$(printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | head -n1 | awk '{print $2, $4}')"
+  warn "Первое подключение к ${host}:${port}; отпечаток ключа: ${fp:-?}"
+  if [ "${XKIT_YES:-0}" = "1" ] || [ ! -t 0 ]; then
+    warn "Принимаю без подтверждения (XKIT_YES/не-интерактив; TOFU — сверьте с консолью провайдера)"
+  else
+    read -r -p "Совпадает с консолью провайдера? [y/N]: " a || a=""
+    case "$a" in y|Y|yes|Yes) ;; *) return 1 ;; esac
+  fi
+  printf '%s\n' "$scan" >> "$kh"
+  return 0
 }
 
 # отпечаток публичного ключа сертификата (пин, как SSH TOFU): защита panel-API
@@ -3385,8 +3625,13 @@ node_api() { # $1 rec, $2 path, $3 method, $4 JSON-body, $5 cookie
       a+=(-k)   # самоподписанный сертификат панели ноды (пина нет)
     fi
   fi
-  [ -n "$body" ] && a+=(-H 'Content-Type: application/json' -d "$body")
-  curl "${a[@]}" "${url}${path}"
+  [ -n "$body" ] && a+=(-H 'Content-Type: application/json' --data @-)
+  # V-03 (аудит №2): тело через stdin — пароль панели ноды не виден в /proc/<pid>/cmdline
+  if [ -n "$body" ]; then
+    printf '%s' "$body" | curl "${a[@]}" "${url}${path}"
+  else
+    curl "${a[@]}" "${url}${path}"
+  fi
 }
 
 node_login() { # $1 rec, $2 cookie
@@ -3479,13 +3724,20 @@ nodes_ensure_pool() {
 }
 
 # применяет аутбаунды нод + balancer + observatory к шаблону xray на мастере
-# чистая функция (тестируемая): $1 текущий шаблон, $2 nodes.json, $3 pool_tag, $4 стратегия
+# чистая функция (тестируемая): $1 текущий шаблон, $2 путь к nodes.json ИЛИ его
+# содержимое (совместимость с тестами; V-03: прод-вызов идёт через tmpfile 600),
+# $3 pool_tag, $4 стратегия
 nodes_merge_template() {
   command -v python3 >/dev/null 2>&1 || { err "python3 не найден — выполните: apt-get install -y python3"; return 1; }
   python3 - "$1" "$2" "$3" "$4" <<'PY'
-import sys, json
+import sys, json, os
 tpl = json.loads(sys.argv[1]) if sys.argv[1].strip() else {}
-nodes = json.loads(sys.argv[2])
+src = sys.argv[2]
+# V-03: прод передаёт ПУТЬ к файлу (секреты не в argv); тесты — само содержимое
+if os.path.isfile(src):
+    nodes = json.load(open(src))
+else:
+    nodes = json.loads(src)
 pool_tag = sys.argv[3]
 strategy = sys.argv[4] if sys.argv[4] in ("roundRobin", "random", "leastPing", "leastLoad") else "roundRobin"
 
@@ -3555,8 +3807,15 @@ nodes_apply_template() {
     cur="$(jq -r '.obj.xrayTemplateConfig // "{}"' <<<"$all")"
   fi
   jq -e . <<<"$cur" >/dev/null 2>&1 || cur="{}"
-  merged="$(nodes_merge_template "$cur" "$nodes_json" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-roundRobin}")" \
-    || { err "Не удалось собрать шаблон xray"; return 1; }
+  # V-03 (аудит №2): nodes.json (пароли панелей нод, UUID) — через tmpfile 600,
+  # НЕ аргументом в python3 (виден через ps/proc)
+  local nodes_file; nodes_file="$(mktemp /tmp/.xkit-nodes.XXXXXX)" || return 1
+  chmod 600 "$nodes_file" 2>/dev/null || true
+  printf '%s' "$nodes_json" > "$nodes_file"
+  local mrc=0
+  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-roundRobin}")" || mrc=$?
+  rm -f "$nodes_file"
+  [ "$mrc" -eq 0 ] || { err "Не удалось собрать шаблон xray"; return 1; }
   if [ "$API_V3" = "1" ]; then
     resp="$(api_post_raw "panel/api/xray/update" --data-urlencode "xraySetting=${merged}")"
     if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
@@ -3582,7 +3841,12 @@ node_reality_scan_pick() { # $1 rec ноды
     case "$tlist" in ERR:*) err "$tlist"; return 1 ;; esac
   fi
   log "Сканирую с ноды: TCP :443 (50 потоков) -> TLS-детали..."
-  node_ssh "$rec" "env TARGETS='${tlist}' bash -s" > "$out" <<'EOS' || true
+  # V-01 (аудит №2): список целей уходит на ноду base64'ом (вне shell-строки);
+  # токены уже валидированы в reality_expand_targets — двойной барьер
+  local tb64; tb64="$(printf '%s' "$tlist" | base64 -w0)"
+  node_ssh "$rec" "TARGETS_B64='${tb64}' bash -s" > "$out" <<'EOS' || true
+TARGETS=""
+[ -n "${TARGETS_B64:-}" ] && TARGETS="$(printf '%s' "$TARGETS_B64" | base64 -d)"
 probe() { timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/443' _ "$1" 2>/dev/null && echo "$1"; }
 export -f probe
 TMP="$(mktemp)"; OPEN="$(mktemp)"
@@ -3700,13 +3964,16 @@ node_add() {
   [ -n "$fp" ] && ok "Ключ хоста ноды зафиксирован (TOFU; можно сверить с консолью провайдера): ${fp}"
 
   log "Устанавливаю 3X-UI на ноду (если его нет)..."
-  node_ssh "$rec" 'bash -s' <<'EOS' || { err "Установка 3X-UI на ноде не удалась"; return 1; }
+  # K-02: тот же тег-релиз, что и на мастере; URL валидирован в xui_install_url
+  local xuiu; xuiu="$(xui_install_url)"
+  node_ssh "$rec" "XUI_URL='${xuiu}' bash -s" <<'EOS' || { err "Установка 3X-UI на ноде не удалась"; return 1; }
 export DEBIAN_FRONTEND=noninteractive
 command -v curl >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq curl sqlite3 >/dev/null 2>&1; }
 if ! command -v x-ui >/dev/null 2>&1; then
   DL="$(mktemp)"
-  curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$DL" \
+  curl -fsSL "${XUI_URL:?}" -o "$DL" \
     || { echo "ERR: не удалось скачать установщик 3X-UI"; rm -f "$DL"; exit 1; }
+  bash -n "$DL" || { echo "ERR: установщик 3X-UI не проходит bash -n (K-02)"; rm -f "$DL"; exit 1; }
   XUI_NONINTERACTIVE=1 bash "$DL" </dev/null
   rm -f "$DL"
 fi
@@ -4153,7 +4420,7 @@ pool_remove_force() { # без вопросов — для nodes_del и меню
   [ -n "$id" ] || { warn "Pool не настроен — сервер уже в одиночном режиме"; return 0; }
   # 1) инбаунд в панели (если панель жива)
   if kit_session >/dev/null 2>&1; then
-    if api_post "del/${id}" "" 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then
+    if api_del_inbound "$id" 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then
       ok "Pool-инбаунд #${id} удалён из панели"
     else
       warn "Панель не удалила pool-инбаунд #${id} — проверьте вручную"
@@ -4267,6 +4534,7 @@ ssh_hook_toggle() {
       && ok "Команда xkit установлена/обновлена: $XKIT_BIN"
   fi
   xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
+  xkit_extras_install || warn "TUI/модуль протоколов не установлен — выполните xkit update"
   if grep -q "# >>> xkit-menu >>>" /root/.bashrc 2>/dev/null; then
     sed -i '/# >>> xkit-menu >>>/,/# <<< xkit-menu <<</d' /root/.bashrc
     ok "Авто-меню при входе по SSH ВЫКЛЮЧЕНО (запускайте xkit вручную)"
@@ -4481,7 +4749,7 @@ dash_user_gen() { printf 'dash%s' "$(rand_hex 2)"; }
 dash_htpasswd_write() { # из XKIT_DASH_USER / XKIT_DASH_PASS
   local u="${XKIT_DASH_USER:-}" p="${XKIT_DASH_PASS:-}" h
   [ -n "$u" ] && [ -n "$p" ] || return 1
-  h="$(openssl passwd -apr1 "$p" 2>/dev/null)" || return 1
+  h="$(printf '%s\n' "$p" | openssl passwd -apr1 -stdin 2>/dev/null)" || return 1   # V-03: не в argv
   [ -n "$h" ] || return 1
   printf '%s:%s\n' "$u" "$h" > "${XKIT_DASH_HTPASSWD}"
   chown root:www-data "${XKIT_DASH_HTPASSWD}" 2>/dev/null || true
@@ -4719,8 +4987,16 @@ dash_gen_locked() {
           # формат не распознан — пусто безопаснее, чем raw
           inbounds="[]"; users="[]"
         elif jq -e '[ .[] | has("settings") or has("streamSettings") ] | any' <<<"$old_inb" >/dev/null 2>&1; then
-          # raw v4.3: пользователей считаем заново из сырых данных (результат чистый)
-          users="$(dash_sanitize_users "$old_inb")"
+          # raw v4.3 ИЛИ смешанный формат (№1, аудит №1): users считаем из СЫРЫХ
+          # элементов и ОБЪЕДИНЯЕМ с users sanitized-элементов прошлого data.json
+          # (раньше смешанный дамп молча терял клиентов sanitized-инбаундов)
+          local raw_inb
+          raw_inb="$(jq -c '[ .[] | select(has("settings") or has("streamSettings")) ]' <<<"$old_inb" 2>/dev/null || echo '[]')"
+          old_users="$(jq -c '.users // []' <<<"$old" 2>/dev/null || true)"
+          jq -e '(.|type) == "array"' <<<"$old_users" >/dev/null 2>&1 || old_users="[]"
+          users="$( { dash_sanitize_users "$raw_inb"; printf '%s\n' "$old_users"; } \
+            | jq -c -s 'add | unique_by((.email // "?")+"\u0000"+(.ib // "?")) | sort_by(-(.total // 0)) | .[0:10]' 2>/dev/null || echo '[]')"
+          users="$(dash_users_whitelist "$users")"
         else
           # уже sanitized (v4.4+): оставляем users, пропустив через whitelist
           old_users="$(jq -c '.users // []' <<<"$old" 2>/dev/null || true)"
@@ -5137,6 +5413,12 @@ dash_rotate() {
   # пересчёт мог упасть и оставить новый пароль в htpasswd при старом env)
   local htbk; htbk="$(mktemp /tmp/.xkit-htbk.XXXXXX 2>/dev/null)" || htbk=""
   if [ -n "$htbk" ]; then cp -f "$XKIT_DASH_HTPASSWD" "$htbk" 2>/dev/null || htbk=""; fi
+  if [ -z "$htbk" ]; then
+    # №4 (аудит №1): без бэкапа откат невозможен — рассинхрон «nginx требует
+    # новый пароль, env — старый». Честно отменяем ДО генерации новых значений
+    err "Не удалось создать бэкап htpasswd — ротация отменена, ничего не изменено"
+    return 1
+  fi
   XKIT_DASH_TOKEN="$(rand_str 24)"
   XKIT_DASH_USER="$(dash_user_gen)"
   XKIT_DASH_PASS="$(rand_str 20)"
@@ -5233,6 +5515,10 @@ dash_menu() {
 xkit_tg_send() { # $1 текст; 0 = доставлено или TG не настроен
   local msg="$1" token="${XKIT_TG_TOKEN:-}" chat="${XKIT_TG_CHAT:-}"
   [ -n "$token" ] && [ -n "$chat" ] || return 0   # TG не настроен — тихо
+  # №9 (аудит №1): токен из env уходит в curl-конфиг — убеждаемся в формате,
+  # иначе мусор/инъекция из xkit.env доедет до curl
+  [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] \
+    || { warn "TG-токен в env невалиден — уведомление пропущено (xkit 6 → 2 — перенастройте)"; return 1; }
   [ -n "$msg" ] || return 0
   # urlencoded POST-body (chat_id и text кодируются @uri: переводы строк -> %0A,
   # кавычек/бэкслэшей не остаётся — строка безопасна для curl-конфига)
@@ -5659,6 +5945,11 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
     return 1
   fi
   case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  # K-02: http:// наружу запрещён (локальные зеркала для тестов — можно)
+  case "$base" in
+    http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+    http://*) err "K-02: обновление по http:// запрещено — укажите https://-источник"; return 1 ;;
+  esac
   local tmp tmpm sumf
   tmp="$(mktemp /tmp/.xkit-update.XXXXXX)" || return 1
   log "Скачиваю ${base}/xkit.sh ..."
@@ -5688,14 +5979,26 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
     if [ -n "$tmpm" ]; then
       want="$(awk '$2=="xkit_menu.sh"{print $1; exit}' "$sumf")"
       got="$(sha256sum "$tmpm" | awk '{print $1}')"
-      if [ -n "$want" ] && [ "$want" != "$got" ]; then
+      if [ -z "$want" ]; then
+        # K-02: меню без суммы не ставим — оставляем установленное
+        warn "В пломбе нет строки xkit_menu.sh — меню НЕ обновляю (оставляю установленное)"
+        rm -f "$tmpm"; tmpm=""
+      elif [ "$want" != "$got" ]; then
         err "SHA-256 xkit_menu.sh НЕ совпал — обновление отменено"
         rm -f "$tmp" "$sumf" "$tmpm"; return 1
+      else
+        ok "SHA-256 проверен: xkit_menu.sh $got"
       fi
-      ok "SHA-256 проверен: xkit_menu.sh $got"
     fi
   else
-    warn "xkit.sh.sha256 недоступен — ставлю без проверки контрольной суммы"
+    if [ "${XKIT_ALLOW_UNVERIFIED:-0}" != "1" ]; then
+      # K-02: fail-closed — без пломбы код не ставится
+      err "xkit.sh.sha256 недоступен — обновление ОТМЕНЕНО (K-02: без суммы код не ставится)"
+      err "Осознанный обход: XKIT_ALLOW_UNVERIFIED=1 xkit update"
+      rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
+      return 1
+    fi
+    warn "xkit.sh.sha256 недоступен, но задан XKIT_ALLOW_UNVERIFIED=1 — ставлю без проверки"
   fi
   bash -n "$tmp" || { err "Новый файл не проходит bash -n — обновление отменено"; rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"; return 1; }
   if [ -n "$tmpm" ]; then
@@ -5722,6 +6025,8 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
     fi
   fi
   rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
+  # v5.2: после ядра/меню атомарно обновляем модуль протоколов и TUI.
+  xkit_extras_install || warn "Дополнительные компоненты обновятся при следующем запуске"
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
   return 0
@@ -5733,13 +6038,38 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
 #   1) рядом с самим xkit.sh   2) $XKIT_MENU_DIR (/usr/local/lib/xkit)
 #   3) каталог команды xkit    4) /etc/xkit
 # Не нашли — докачиваем с XKIT_REPO_URL со сверкой SHA-256 (строка 2 пломбы).
+
+# V-02 (аудит №2): код под root грузится ТОЛЬКО из доверенных мест — владелец
+# root, без group/world-write, каталоги /tmp, /var/tmp, /dev/shm запрещены
+xkit_dir_trusted() { # $1 каталог, $2 файл -> 0 = доверенный
+  local d="$1" f="$2" st myuid
+  case "$d" in /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*|/run/shm*) return 1 ;; esac
+  myuid="$(id -u 2>/dev/null || echo 0)"
+  st="$(stat -Lc '%u %a' "$d" 2>/dev/null)" || return 1
+  # владелец = root ИЛИ текущий пользователь (dev-каталог в своей домашке —
+  # доверенно; ЧУЖОЙ владелец при запуске под root — нет)
+  { [ "${st%% *}" = "0" ] || [ "${st%% *}" = "$myuid" ]; } || return 1
+  [ $(( 8#${st#* } & 8#022 )) -eq 0 ] || return 1
+  st="$(stat -Lc '%u %a' "$f" 2>/dev/null)" || return 1
+  { [ "${st%% *}" = "0" ] || [ "${st%% *}" = "$myuid" ]; } || return 1
+  [ $(( 8#${st#* } & 8#022 )) -eq 0 ] || return 1
+  return 0
+}
+
 xkit_menu_src() { # -> печатает путь к найденному xkit_menu.sh; 1 = не нашли
   local d f self
   self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-  for d in "$(dirname "$self")" "${XKIT_MENU_DIR}" "${XKIT_BIN%/*}" "/etc/xkit"; do
+  # №19 (аудит №1): dirname вместо ${XKIT_BIN%/*} (без слэша давал мусорный путь)
+  for d in "$(dirname "$self")" "${XKIT_MENU_DIR}" "$(dirname -- "${XKIT_BIN:-/usr/local/bin/xkit}" 2>/dev/null)" "/etc/xkit"; do
     [ -n "$d" ] || continue
     f="$d/xkit_menu.sh"
-    if [ -r "$f" ]; then printf '%s\n' "$f"; return 0; fi
+    [ -r "$f" ] || continue
+    # V-02: подозрительное расположение (например, /tmp) — пропускаем кандидата
+    if ! xkit_dir_trusted "$d" "$f"; then
+      warn "Пропускаю $f: каталог/файл не доверенные (owner/mode, V-02)"
+      continue
+    fi
+    printf '%s\n' "$f"; return 0
   done
   return 1
 }
@@ -5760,15 +6090,29 @@ xkit_menu_fetch() { # авто-докачка меню (потеря файла 
       err "SHA-256 xkit_menu.sh НЕ совпал — докачка отменена"
       rm -f "$tmp" "$sumf"; return 1
     fi
+    if [ -z "$want" ]; then
+      # K-02: без суммы докачка fail-open'ом больше не проходит
+      err "В пломбе нет строки xkit_menu.sh — докачка отменена (K-02)"
+      rm -f "$tmp" "$sumf"; return 1
+    fi
   else
-    warn "Сумма xkit_menu.sh недоступна — ставлю без проверки"
+    err "Сумма xkit_menu.sh недоступна — докачка отменена (K-02; осознанный обход: XKIT_ALLOW_UNVERIFIED=1)"
+    if [ "${XKIT_ALLOW_UNVERIFIED:-0}" != "1" ]; then
+      rm -f "$tmp"; return 1
+    fi
+    warn "XKIT_ALLOW_UNVERIFIED=1 — ставлю меню без проверки"
   fi
   bash -n "$tmp" 2>/dev/null || { err "xkit_menu.sh не проходит bash -n — докачка отменена"; rm -f "$tmp" "$sumf"; return 1; }
+  local rc=0
+  # F-1 (аудит №2): раньше local rc=$? стоял после if и всегда был 0 —
+  # неудачная установка меню маскировалась «ок»
   if install -m 700 "$tmp" "${XKIT_MENU_DIR}/xkit_menu.sh.new" \
      && mv -f "${XKIT_MENU_DIR}/xkit_menu.sh.new" "${XKIT_MENU_DIR}/xkit_menu.sh"; then
     ok "Модуль меню докачан: ${XKIT_MENU_DIR}/xkit_menu.sh"
+  else
+    err "Не удалось установить xkit_menu.sh в ${XKIT_MENU_DIR}"
+    rc=1
   fi
-  local rc=$?
   rm -f "$tmp" "$sumf"
   return $rc
 }
@@ -5777,12 +6121,18 @@ xkit_menu_install() { # положить модуль меню в $XKIT_MENU_DIR
   local self src
   self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
   src="$(dirname "$self")/xkit_menu.sh"
-  if [ -r "$src" ]; then
+  if [ -r "$src" ] && xkit_dir_trusted "$(dirname "$src")" "$src"; then
     mkdir -p "$XKIT_MENU_DIR" 2>/dev/null || return 1
-    cp -f "$src" "${XKIT_MENU_DIR}/xkit_menu.sh" && chmod 700 "${XKIT_MENU_DIR}/xkit_menu.sh" \
-      && ok "Модуль меню: ${XKIT_MENU_DIR}/xkit_menu.sh"
+    # F-2 (аудит №2): раньше cp без ветки неудачи — функция возвращала 0 даже при сбое
+    if cp -f "$src" "${XKIT_MENU_DIR}/xkit_menu.sh" && chmod 700 "${XKIT_MENU_DIR}/xkit_menu.sh"; then
+      ok "Модуль меню: ${XKIT_MENU_DIR}/xkit_menu.sh"
+    else
+      err "Не удалось скопировать модуль меню в ${XKIT_MENU_DIR}"
+      return 1
+    fi
     return 0
   fi
+  [ -r "$src" ] && warn "Локальный $src не доверенный (V-02) — меню будет докачано из репо"
   # рядом со скриптом нет (установка из пайпа) — докачаем с репо
   xkit_menu_fetch \
     || warn "xkit_menu.sh не найден рядом и не докачан — меню скачается при первом запуске xkit"
@@ -5804,12 +6154,123 @@ xkit_load_menu() { # подключить модуль меню (source); 1 = н
   return 1
 }
 
+#=========================== V5.2: TUI И ПРОТОКОЛЫ ============================
+xkit_component_fetch() { # $1 имя в репо, $2 конечный файл; SHA-256 обязателен
+  local base="${XKIT_REPO_URL:-}" name="$1" dst="$2" tmp sumf want got
+  [ -n "$base" ] || return 1
+  case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  case "$base" in http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;; http://*) return 1 ;; esac
+  tmp="$(mktemp /tmp/.xkit-component.XXXXXX)" || return 1
+  sumf="$(mktemp /tmp/.xkit-component-sum.XXXXXX)" || { rm -f "$tmp"; return 1; }
+  curl -fsSL "${base}/${name}" -o "$tmp" && curl -fsSL "${base}/xkit.sh.sha256" -o "$sumf" || { rm -f "$tmp" "$sumf"; return 1; }
+  want="$(awk -v n="$name" '$2==n{print $1;exit}' "$sumf")"
+  got="$(sha256sum "$tmp" | awk '{print $1}')"
+  [ -n "$want" ] && [ "$want" = "$got" ] || { err "SHA-256 ${name} не совпал или отсутствует"; rm -f "$tmp" "$sumf"; return 1; }
+  case "$name" in *.sh) bash -n "$tmp" || { rm -f "$tmp" "$sumf"; return 1; } ;; esac
+  mkdir -p "$(dirname "$dst")" && install -m 700 "$tmp" "${dst}.new" && mv -f "${dst}.new" "$dst" || { rm -f "$tmp" "$sumf"; return 1; }
+  rm -f "$tmp" "$sumf"
+  ok "Компонент установлен: $dst"
+}
+
+xkit_extras_install() { # протоколы + TUI текущей архитектуры
+  local self src arch name rc=0
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  src="$(dirname "$self")"
+  mkdir -p "$XKIT_MENU_DIR" || return 1
+  if [ -r "$src/xkit_protocols.sh" ] && xkit_dir_trusted "$src" "$src/xkit_protocols.sh"; then
+    [ ! -f "$XKIT_PROTOCOLS_FILE" ] || cp -f "$XKIT_PROTOCOLS_FILE" "${XKIT_PROTOCOLS_FILE}.bak"
+    install -m 700 "$src/xkit_protocols.sh" "$XKIT_PROTOCOLS_FILE" || rc=1
+  else
+    xkit_component_fetch xkit_protocols.sh "$XKIT_PROTOCOLS_FILE" || rc=1
+  fi
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) warn "TUI: архитектура $(uname -m) не поддерживается"; return "$rc" ;; esac
+  name="xkit-tui-linux-${arch}"
+  if [ -r "$src/$name" ] && xkit_dir_trusted "$src" "$src/$name"; then
+    [ ! -f "$XKIT_TUI_FILE" ] || cp -f "$XKIT_TUI_FILE" "${XKIT_TUI_FILE}.bak"
+    install -m 700 "$src/$name" "$XKIT_TUI_FILE" || rc=1
+  else
+    xkit_component_fetch "$name" "$XKIT_TUI_FILE" || rc=1
+  fi
+  return "$rc"
+}
+
+xkit_protocols_load() {
+  local f="$XKIT_PROTOCOLS_FILE" self
+  if [ ! -r "$f" ]; then
+    self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    [ -r "$(dirname "$self")/xkit_protocols.sh" ] && f="$(dirname "$self")/xkit_protocols.sh"
+  fi
+  if [ -r "$f" ] && xkit_dir_trusted "$(dirname "$f")" "$f"; then
+    XKIT_PROTOCOLS_FILE="$f"; . "$f"; return 0
+  fi
+  err "Модуль протоколов не найден или не доверен: $f (выполните xkit update)"
+  return 1
+}
+
+xkit_tui_run() {
+  [ "${XKIT_TUI:-1}" = 1 ] && [ "${FORCE_CLASSIC:-0}" != 1 ] || return 1
+  [ -t 0 ] && [ -t 1 ] || return 1
+  if [ ! -x "$XKIT_TUI_FILE" ]; then
+    local self0 arch0
+    self0="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    case "$(uname -m)" in x86_64) arch0=amd64 ;; aarch64|arm64) arch0=arm64 ;; *) arch0=unknown ;; esac
+    [ -r "$(dirname "$self0")/xkit-tui-linux-${arch0}" ] && XKIT_TUI_FILE="$(dirname "$self0")/xkit-tui-linux-${arch0}"
+  fi
+  if [ ! -x "$XKIT_TUI_FILE" ] && [ "$(id -u)" = 0 ]; then
+    load_xkit_env >/dev/null 2>&1 || true
+    xkit_extras_install >/dev/null 2>&1 || true
+  fi
+  [ -x "$XKIT_TUI_FILE" ] && xkit_dir_trusted "$(dirname "$XKIT_TUI_FILE")" "$XKIT_TUI_FILE" || return 1
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  "$XKIT_TUI_FILE" --xkit "$self"
+}
+
+xkit_snapshot() { # только агрегаты; без UUID, privateKey, паролей и токенов
+  load_xkit_env >/dev/null 2>&1 || true
+  local host="${XKIT_HOST:-}" mode=solo nodes=0 nodes_ok=0 clients=0 cert_days=-1 backup_hours=-1
+  local nginx=false xui=false xray=false protocols='[]' inbounds=''
+  systemctl is-active --quiet nginx 2>/dev/null && nginx=true
+  systemctl is-active --quiet x-ui 2>/dev/null && xui=true
+  pgrep -x xray >/dev/null 2>&1 && xray=true
+  if [ -r "$XKIT_NODES" ]; then nodes="$(jq 'length' "$XKIT_NODES" 2>/dev/null || echo 0)"; fi
+  [[ "$nodes" =~ ^[0-9]+$ ]] || nodes=0
+  [ "$nodes" -gt 0 ] && mode=master
+  if [ -r "${XKIT_DASH_DIR}/data.json" ]; then
+    nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "${XKIT_DASH_DIR}/data.json" 2>/dev/null || echo 0)"
+  fi
+  [[ "$nodes_ok" =~ ^[0-9]+$ ]] || nodes_ok=0
+  if [ -r "${XKIT_CRT:-}" ]; then
+    local end_epoch now_epoch
+    end_epoch="$(date -d "$(openssl x509 -in "$XKIT_CRT" -noout -enddate 2>/dev/null | cut -d= -f2-)" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"; [ "$end_epoch" -gt 0 ] && cert_days=$(( (end_epoch-now_epoch)/86400 ))
+  fi
+  local latest; latest="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'xkit-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)"
+  if [ -n "$latest" ]; then backup_hours=$(( ($(date +%s)-$(stat -c %Y "$latest" 2>/dev/null || date +%s))/3600 )); fi
+  if kit_session >/dev/null 2>&1; then
+    inbounds="$(api_list 2>/dev/null || true)"
+    clients="$(jq '[.[]?|(.settings|fromjson?|.clients[]?)|.email]|unique|length' <<<"$inbounds" 2>/dev/null || echo 0)"
+  fi
+  [[ "$clients" =~ ^[0-9]+$ ]] || clients=0
+  if xkit_protocols_load >/dev/null 2>&1; then
+    protocols="$(protocols_snapshot_json 2>/dev/null || echo '[]')"
+  fi
+  jq -nc --arg host "$host" --arg mode "$mode" --arg generated "$(date -Iseconds)" \
+    --argjson nodes "$nodes" --argjson nodes_ok "$nodes_ok" --argjson clients "$clients" \
+    --argjson nginx "$nginx" --argjson xui "$xui" --argjson xray "$xray" \
+    --argjson cert_days "$cert_days" --argjson backup_hours "$backup_hours" --argjson protocols "$protocols" \
+    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,generated:$generated}'
+}
+
 usage() {
   cat <<EOF
 XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню как у родного x-ui
 
 Использование:
-  xkit                 — интерактивное меню (6 групп с подменю)
+  xkit                 — полноэкранный TUI (при наличии; иначе классическое меню)
+  xkit --classic       — классическое Bash-меню (6 групп с подменю)
+  xkit protocols       — REALITY/XHTTP/AmneziaWG/Hysteria 2
+  xkit protocols list [--json] — санитизированная сводка профилей
+  xkit snapshot        — JSON состояния для TUI (без секретов)
   xkit install         — установка одним шагом (при уже установленном — меню:
                          обновить / переустановить чисто / починить поверх)
   xkit reinstall       — ЧИСТАЯ переустановка: бэкап -> полное удаление -> установка
@@ -5856,7 +6317,10 @@ EOF
 
 main() {
   case "${1:-menu}" in
-    menu|"") xkit_load_menu || exit 1; menu_loop ;;
+    menu|"") if xkit_tui_run; then exit 0; fi; xkit_load_menu || exit 1; menu_loop ;;
+    --classic|classic) xkit_load_menu || exit 1; menu_loop ;;
+    protocols|proto) shift; require_root; xkit_protocols_load || exit 1; protocols_main "$@" ;;
+    snapshot) xkit_snapshot ;;
     install) require_root; one_step_install ;;
     reinstall) require_root; xkit_reinstall ;;
     uninstall) shift; require_root; xkit_uninstall "${1:-}" ;;

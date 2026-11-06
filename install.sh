@@ -2,10 +2,10 @@
 #==============================================================================
 #  XKIT installer — установка xkit.sh одной командой
 #
-#  GitHub (рекомендуемый вариант, файлы install.sh + xkit.sh в одном репо):
+#  GitHub (рекомендуемый вариант, все компоненты релиза в одном репо):
 #    curl -fsSL https://raw.githubusercontent.com/kalsifar/xkit/main/install.sh | sudo bash
 #
-#  Свой сервер (оба файла в одной папке за nginx):
+#  Свой сервер (ядро, меню, протоколы, TUI и пломба в одной папке за nginx):
 #    curl -fsSL https://ВАШ_ДОМЕН/xkit/install.sh | sudo bash
 #
 #  Скачанный заранее файл:
@@ -24,6 +24,14 @@
 # Форкнули/переименовали? Замените ник ниже или задайте XKIT_BASE/URL при запуске:
 XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kalsifar/xkit/main}"
 
+# (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
+# dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
+XKIT_PIN_SHA256="83d161fece6bac20f8424f1b7533e53ee22e69c59a6b10f24993a61d459f6497"
+XKIT_PIN_MENU_SHA256="732b5f5d740d5a0135936cefb70ac69922057eb127c9caa4af4b64d818dc7ff0"
+XKIT_PIN_PROTOCOLS_SHA256="5bc6172ef775f11a81fa6b875e4468cc6c9b8787e0d62cf671dc1accbf4614d2"
+XKIT_PIN_TUI_AMD64_SHA256="0273fefdc7b7c712a83fdb12cda1f1c4baee16f7f8a3f0e0cadfad89ab289d71"
+XKIT_PIN_TUI_ARM64_SHA256="c176ca957339dcc0b09112904b3640150e07de8e316673f3fef5453af5015497"
+
 set -u
 # TTY-детект (ревью v4.7): при не-терминале (curl|bash | tee log) цвета гаснут —
 # в логах не остаётся сырых \033[ кодов
@@ -37,6 +45,21 @@ log(){ echo -e "${C_G}[i]${C_N} $*"; }
 # попадать в пайпы/захват stdout, даже если сегодня тут никто не захватывает
 warn(){ echo -e "${C_Y}[!]${C_N} $*" >&2; }
 err(){ echo -e "${C_R}[x] $*${C_N}" >&2; }
+
+# (K-02/V-02) доверие локальным файлам: владелец root, без group/world-write;
+# /tmp, /var/tmp, /dev/shm — никогда
+install_trust() { # $1 каталог, $2 файл
+  local d="$1" f="$2" st myuid
+  case "$d" in /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*) return 1 ;; esac
+  myuid="$(id -u 2>/dev/null || echo 0)"
+  st="$(stat -Lc '%u %a' "$d" 2>/dev/null)" || return 1
+  { [ "${st%% *}" = "0" ] || [ "${st%% *}" = "$myuid" ]; } || return 1
+  [ $(( 8#${st#* } & 8#022 )) -eq 0 ] || return 1
+  st="$(stat -Lc '%u %a' "$f" 2>/dev/null)" || return 1
+  { [ "${st%% *}" = "0" ] || [ "${st%% *}" = "$myuid" ]; } || return 1
+  [ $(( 8#${st#* } & 8#022 )) -eq 0 ] || return 1
+  return 0
+}
 
 # --- разбор аргументов: -y/--yes и --force пробрасываются в xkit (XKIT_YES/
 # XKIT_FORCE — неинтерактивный режим/CI), первый http(s)-аргумент = источник,
@@ -60,6 +83,12 @@ REPO="${URL_ARG:-$XKIT_BASE}"
 REPO="${REPO%/xkit.sh}"
 export XKIT_REPO_URL="$REPO"
 
+# (K-02) только https; http:// разрешён ТОЛЬКО для локальных зеркал (тесты)
+case "$REPO" in
+  http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+  http://*) err "K-02: http://-источники запрещены — используйте https://"; exit 1 ;;
+esac
+
 # --- источник xkit.sh: сначала ищем рядом с самим install.sh
 # basename/readlink с «--» — GNU/BusyBox по-разному едят имена с ведущим «-»
 SRC=""
@@ -82,8 +111,20 @@ WORK="$(mktemp -d)" || exit 1
 trap 'rm -rf "$WORK"' EXIT
 trap 'rm -rf "$WORK"; printf "Прервано.\n" >&2; exit 130' INT TERM
 
+# (K-02/V-02) локальная копия — только из доверенного места и с верным pin
+if [ -n "$SRC" ] && ! install_trust "$(dirname -- "$SRC")" "$SRC"; then
+  warn "Локальный $SRC не доверенный (owner/mode или /tmp) — игнорирую, качаю из репо"
+  SRC=""
+fi
 if [ -n "$SRC" ]; then
-  log "Найден локальный xkit.sh рядом с install.sh: $SRC"
+  if [ "$XKIT_PIN_SHA256" != "@@XKIT_PIN_SHA256@@" ]; then
+    _g="$(sha256sum "$SRC" | awk '{print $1}')"
+    [ "$_g" = "$XKIT_PIN_SHA256" ] \
+      || { err "Локальный xkit.sh не совпал с pin-хэшем install.sh (K-02) — установка отменена"; exit 1; }
+    log "Найден локальный xkit.sh рядом с install.sh (pin совпал): $SRC"
+  else
+    log "Найден локальный xkit.sh рядом с install.sh: $SRC"
+  fi
   cp -f "$SRC" "$WORK/xkit.sh" || exit 1
 else
   BASE="${URL_ARG:-$XKIT_BASE}"
@@ -106,20 +147,32 @@ else
     err "Нужен curl или wget"; exit 1
   fi
 
-  # контрольная сумма — если рядом опубликован xkit.sh.sha256
-  SUMURL="${RAW%/*}/xkit.sh.sha256"
-  if curl -fsSL "$SUMURL" -o "$WORK/xkit.sh.sha256" 2>/dev/null \
-     || wget -qO "$WORK/xkit.sh.sha256" "$SUMURL" 2>/dev/null; then
-    WANT="$(awk 'NR==1{print $1}' "$WORK/xkit.sh.sha256")"
-    GOT="$(sha256sum "$WORK/xkit.sh" | awk '{print $1}')"
-    if [ -n "$WANT" ] && [ "$WANT" = "$GOT" ]; then
+  # контрольная сумма (K-02): pin из install.sh > пломба из репо; нет ничего — отказ
+  WANT=""
+  if [ "$XKIT_PIN_SHA256" != "@@XKIT_PIN_SHA256@@" ]; then
+    WANT="$XKIT_PIN_SHA256"
+    log "Использую pin-хэш релиза из install.sh"
+  else
+    SUMURL="${RAW%/*}/xkit.sh.sha256"
+    if curl -fsSL "$SUMURL" -o "$WORK/xkit.sh.sha256" 2>/dev/null \
+       || wget -qO "$WORK/xkit.sh.sha256" "$SUMURL" 2>/dev/null; then
+      WANT="$(awk 'NR==1{print $1}' "$WORK/xkit.sh.sha256")"
+    fi
+  fi
+  GOT="$(sha256sum "$WORK/xkit.sh" | awk '{print $1}')"
+  if [ -n "$WANT" ]; then
+    if [ "$WANT" = "$GOT" ]; then
       log "SHA-256 проверен: $GOT"
     else
       err "SHA-256 НЕ совпал — файл битый или изменён. Установка отменена."
       exit 1
     fi
+  elif [ "${XKIT_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    warn "XKIT_ALLOW_UNVERIFIED=1 — ставлю БЕЗ проверки суммы"
   else
-    warn "sha256 не проверен (xkit.sh.sha256 рядом с файлом не найден)"
+    err "Проверить xkit.sh нечем: pin-хэша нет, xkit.sh.sha256 не найден (K-02)."
+    err "Осознанный обход: XKIT_ALLOW_UNVERIFIED=1 bash install.sh ..."
+    exit 1
   fi
 fi
 
@@ -134,10 +187,25 @@ chmod 700 "$WORK/xkit.sh"
 MENU_OK=1
 SRCDIR=""
 [ -n "$SRC" ] && SRCDIR="$(cd "$(dirname -- "$SRC")" 2>/dev/null && pwd)"
+USE_LOCAL_MENU=0
 if [ -n "$SRCDIR" ] && [ -f "$SRCDIR/xkit_menu.sh" ]; then
-  cp -f "$SRCDIR/xkit_menu.sh" "$WORK/xkit_menu.sh" || exit 1
-  log "Модуль меню найден рядом: $SRCDIR/xkit_menu.sh"
-else
+  # (K-02/V-02) локальное меню — доверенное место + pin; иначе качаем из репо
+  if ! install_trust "$SRCDIR" "$SRCDIR/xkit_menu.sh"; then
+    warn "Локальный xkit_menu.sh не доверенный (owner/mode или /tmp) — качаю из репо"
+  elif [ "$XKIT_PIN_MENU_SHA256" != "@@XKIT_PIN_MENU_SHA256@@" ]; then
+    _gm="$(sha256sum "$SRCDIR/xkit_menu.sh" | awk '{print $1}')"
+    [ "$_gm" = "$XKIT_PIN_MENU_SHA256" ] \
+      || { err "Локальный xkit_menu.sh не совпал с pin-хэшем (K-02) — установка отменена"; exit 1; }
+    USE_LOCAL_MENU=1
+  else
+    USE_LOCAL_MENU=1
+  fi
+  if [ "$USE_LOCAL_MENU" = "1" ]; then
+    cp -f "$SRCDIR/xkit_menu.sh" "$WORK/xkit_menu.sh" || exit 1
+    log "Модуль меню найден рядом: $SRCDIR/xkit_menu.sh"
+  fi
+fi
+if [ "$USE_LOCAL_MENU" != "1" ]; then
   MENUURL="${REPO}/xkit_menu.sh"   # REPO уже без /xkit.sh на конце
   log "Скачиваю: $MENUURL"
   if command -v curl >/dev/null 2>&1; then
@@ -147,15 +215,27 @@ else
   else
     err "Нужен curl или wget"; exit 1
   fi
-  # сумма меню — строка 2 пломбы (формат sha256sum, 2 строки, v5.0.0)
-  if [ "$MENU_OK" = "1" ] && [ -s "$WORK/xkit_menu.sh" ] && [ -s "$WORK/xkit.sh.sha256" ]; then
+  # сумма меню (K-02): pin из install.sh > строка 2 пломбы; нет — отказ
+  WANTM=""
+  if [ "$XKIT_PIN_MENU_SHA256" != "@@XKIT_PIN_MENU_SHA256@@" ]; then
+    WANTM="$XKIT_PIN_MENU_SHA256"
+  elif [ -s "$WORK/xkit.sh.sha256" ]; then
     WANTM="$(awk '$2=="xkit_menu.sh"{print $1; exit}' "$WORK/xkit.sh.sha256")"
-    GOTM="$(sha256sum "$WORK/xkit_menu.sh" | awk '{print $1}')"
-    if [ -n "$WANTM" ] && [ "$WANTM" != "$GOTM" ]; then
-      err "SHA-256 xkit_menu.sh НЕ совпал — файл битый или изменён. Установка отменена."
+  fi
+  if [ "$MENU_OK" = "1" ] && [ -s "$WORK/xkit_menu.sh" ]; then
+    if [ -n "$WANTM" ]; then
+      GOTM="$(sha256sum "$WORK/xkit_menu.sh" | awk '{print $1}')"
+      if [ "$WANTM" != "$GOTM" ]; then
+        err "SHA-256 xkit_menu.sh НЕ совпал — файл битый или изменён. Установка отменена."
+        exit 1
+      fi
+      log "SHA-256 xkit_menu.sh проверен: $GOTM"
+    elif [ "${XKIT_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+      warn "XKIT_ALLOW_UNVERIFIED=1 — меню без проверки суммы"
+    else
+      err "Проверить xkit_menu.sh нечем: pin и пломбы нет (K-02). Осознанный обход: XKIT_ALLOW_UNVERIFIED=1"
       exit 1
     fi
-    [ -n "$WANTM" ] && log "SHA-256 xkit_menu.sh проверен: $GOTM"
   fi
 fi
 if [ -s "$WORK/xkit_menu.sh" ]; then
@@ -164,6 +244,39 @@ if [ -s "$WORK/xkit_menu.sh" ]; then
 else
   warn "xkit_menu.sh не скачался — xkit докачает меню при первом запуске (xkit update)"
 fi
+
+# --- v5.2: модуль протоколов и TUI. Каждый файл проверяется отдельно.
+# В WORK они нужны одношаговому установщику; при V-02-запрете /tmp ядро
+# повторно скачает их через xkit_component_fetch с той же пломбой.
+fetch_release_component() { # $1 имя, $2 pin
+  local name="$1" pin="$2" want="" got=""
+  if [ -n "$SRCDIR" ] && [ -f "$SRCDIR/$name" ] && install_trust "$SRCDIR" "$SRCDIR/$name"; then
+    if [[ "$pin" != @@*@@ ]]; then
+      got="$(sha256sum "$SRCDIR/$name" | awk '{print $1}')"
+      [ "$got" = "$pin" ] || { err "Локальный $name не совпал с pin-хэшем — установка отменена"; exit 1; }
+    fi
+    cp -f "$SRCDIR/$name" "$WORK/$name" || exit 1
+  else
+    log "Скачиваю: ${REPO}/${name}"
+    curl -fsSL "${REPO}/${name}" -o "$WORK/$name" || { err "Не удалось скачать $name"; exit 1; }
+    if [[ "$pin" != @@*@@ ]]; then want="$pin"; fi
+    if [ -z "$want" ]; then
+      [ -s "$WORK/xkit.sh.sha256" ] || curl -fsSL "${REPO}/xkit.sh.sha256" -o "$WORK/xkit.sh.sha256" || true
+      want="$(awk -v n="$name" '$2==n{print $1;exit}' "$WORK/xkit.sh.sha256" 2>/dev/null)"
+    fi
+    got="$(sha256sum "$WORK/$name" | awk '{print $1}')"
+    if [ -n "$want" ] && [ "$want" != "$got" ]; then err "SHA-256 $name не совпал — установка отменена"; exit 1; fi
+    if [ -z "$want" ] && [ "${XKIT_ALLOW_UNVERIFIED:-0}" != 1 ]; then err "Нет SHA-256 для $name (K-02)"; exit 1; fi
+  fi
+  case "$name" in *.sh) bash -n "$WORK/$name" || exit 1 ;; esac
+  chmod 700 "$WORK/$name"
+}
+fetch_release_component xkit_protocols.sh "$XKIT_PIN_PROTOCOLS_SHA256"
+case "$(uname -m)" in
+  x86_64) fetch_release_component xkit-tui-linux-amd64 "$XKIT_PIN_TUI_AMD64_SHA256" ;;
+  aarch64|arm64) fetch_release_component xkit-tui-linux-arm64 "$XKIT_PIN_TUI_ARM64_SHA256" ;;
+  *) warn "TUI для архитектуры $(uname -m) не поставляется; останется классическое меню" ;;
+esac
 
 # --- команды, которым root не нужен (xkit сам проверит root там, где надо)
 case "${XKIT_ARGS[0]}" in
@@ -184,7 +297,7 @@ run_xkit() {
     # через `sudo env VAR=…` — не зависит от env_keep в sudoers
     RUN=(sudo env XKIT_YES="${XKIT_YES:-0}" XKIT_FORCE="${XKIT_FORCE:-0}" \
            XKIT_NO_COLOR="${XKIT_NO_COLOR:-}" XKIT_NO_ANIM="${XKIT_NO_ANIM:-}" \
-           XKIT_REPO_URL="$XKIT_REPO_URL" bash "$WORK/xkit.sh")
+           XKIT_TUI="${XKIT_TUI:-1}" XKIT_REPO_URL="$XKIT_REPO_URL" bash "$WORK/xkit.sh")
   else
     RUN=(bash "$WORK/xkit.sh")
     warn "Нет ни root, ни sudo — xkit сам сообщит, что нужен root"
