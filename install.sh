@@ -26,11 +26,11 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kalsifar/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="1e8d57067c9512435e6587c91c1aa2fa5c0f991c415e5abe4962938521ad50b5"
-XKIT_PIN_MENU_SHA256="732b5f5d740d5a0135936cefb70ac69922057eb127c9caa4af4b64d818dc7ff0"
-XKIT_PIN_PROTOCOLS_SHA256="5bc6172ef775f11a81fa6b875e4468cc6c9b8787e0d62cf671dc1accbf4614d2"
-XKIT_PIN_TUI_AMD64_SHA256="0273fefdc7b7c712a83fdb12cda1f1c4baee16f7f8a3f0e0cadfad89ab289d71"
-XKIT_PIN_TUI_ARM64_SHA256="c176ca957339dcc0b09112904b3640150e07de8e316673f3fef5453af5015497"
+XKIT_PIN_SHA256="5fd780a242039f52c6e20c737a10846071de036dcce6d5e7fce08691e8a39a65"
+XKIT_PIN_MENU_SHA256="1b9f25bc127d9da28f18c8fd8c2121aa7a8d5977b0e536dfb453a9ba96f11648"
+XKIT_PIN_PROTOCOLS_SHA256="a0f368e39af40c081e821ec8d187240b457ce455d0d60a7c2d9781291681cf54"
+XKIT_PIN_TUI_AMD64_SHA256="4ecceb0189725e538239872da0f6334e94bf06209fd1bc53fddaeb8f71603433"
+XKIT_PIN_TUI_ARM64_SHA256="be4b7814424a17987071b8dab1cd8324b9a3d8e7ffdcf7e1b8568a32e9ddf4fc"
 
 set -u
 # TTY-детект (ревью v4.7): при не-терминале (curl|bash | tee log) цвета гаснут —
@@ -123,7 +123,23 @@ if [ -n "$SRC" ]; then
       || { err "Локальный xkit.sh не совпал с pin-хэшем install.sh (K-02) — установка отменена"; exit 1; }
     log "Найден локальный xkit.sh рядом с install.sh (pin совпал): $SRC"
   else
-    log "Найден локальный xkit.sh рядом с install.sh: $SRC"
+    # (баг №5, аудит v5.2.1): dev-режим (pin — плейсхолдер). Если рядом лежит
+    # xkit.sh.sha256 — сверяемся с ним; не совпал — отказ (K-02, fail-closed)
+    _sum="$(dirname -- "$SRC")/xkit.sh.sha256"
+    if [ -f "$_sum" ]; then
+      _want="$(awk 'NR==1{print $1}' "$_sum")"
+      [[ "$_want" =~ ^[0-9a-f]{64}$ ]] || _want=""
+      _got="$(sha256sum "$SRC" | awk '{print $1}')"
+      if [ -n "$_want" ] && [ "$_want" = "$_got" ]; then
+        log "Найден локальный xkit.sh рядом с install.sh (сумма совпала с xkit.sh.sha256): $SRC"
+      else
+        err "Локальный xkit.sh не совпал с xkit.sh.sha256 рядом с install.sh (K-02) — установка отменена"
+        exit 1
+      fi
+    else
+      warn "dev-режим: pin — плейсхолдер, xkit.sh.sha256 рядом нет — локальный xkit.sh принят по install_trust без сверки суммы"
+      log "Найден локальный xkit.sh рядом с install.sh: $SRC"
+    fi
   fi
   cp -f "$SRC" "$WORK/xkit.sh" || exit 1
 else
@@ -157,6 +173,10 @@ else
     if curl -fsSL "$SUMURL" -o "$WORK/xkit.sh.sha256" 2>/dev/null \
        || wget -qO "$WORK/xkit.sh.sha256" "$SUMURL" 2>/dev/null; then
       WANT="$(awk 'NR==1{print $1}' "$WORK/xkit.sh.sha256")"
+      # (з.10, аудит v5.2.1): НЕ-hex мусор в пломбе (HTML-ошибка прокси и т.п.) —
+      # «нечем сверять»; hex любой длины оставляем — не совпадёт и даст честный
+      # «SHA-256 НЕ совпал» вместо вводящего в заблуждение сообщения
+      [[ "$WANT" =~ ^[0-9a-f]+$ ]] || WANT=""
     fi
   fi
   GOT="$(sha256sum "$WORK/xkit.sh" | awk '{print $1}')"
@@ -170,7 +190,7 @@ else
   elif [ "${XKIT_ALLOW_UNVERIFIED:-0}" = "1" ]; then
     warn "XKIT_ALLOW_UNVERIFIED=1 — ставлю БЕЗ проверки суммы"
   else
-    err "Проверить xkit.sh нечем: pin-хэша нет, xkit.sh.sha256 не найден (K-02)."
+    err "Проверить xkit.sh нечем: pin-хэша нет, xkit.sh.sha256 не найден/не содержит корректной суммы (K-02)."
     err "Осознанный обход: XKIT_ALLOW_UNVERIFIED=1 bash install.sh ..."
     exit 1
   fi

@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v5.2.0 — профили доступа: REALITY/XHTTP через 3X-UI, AWG/Hy2 отдельно.
+# XKIT v5.3.1 — профили доступа: REALITY/XHTTP через 3X-UI, AWG/Hy2 отдельно.
 # Подключается только из xkit.sh. Секреты не выводятся в status/list --json.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "Это модуль XKIT — запускайте: xkit protocols" >&2
@@ -112,7 +112,7 @@ proto_xhttp_create() {
     api_update_inbound "$ibid" "$fresh" >/dev/null || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; err "externalProxy не применён — откат"; return 1; }
     fresh="$(api_get_inbound "$ibid")" || return 1
   fi
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw allow "${p}/tcp" >/dev/null || warn "Откройте UDP/TCP порт вручную"; fi
+  xkit_fw_add xhttp "$p" tcp || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; err 'Не удалось открыть TCP-порт XHTTP — inbound удалён'; return 1; }
   cl="$(jq -c '.settings|fromjson?|.clients[0]' <<<"$fresh")"
   link="$(link_for_client "$fresh" "$cl")"
   ok "XHTTP + REALITY создан: ${XKIT_HOST}:${p}${path}"
@@ -127,7 +127,7 @@ proto_state_save() {
   local t; t="$(mktemp /tmp/.xkit-protocols.XXXXXX)" || return 1
   chmod 600 "$t"
   { printf 'HY2_PORT=%q\n' "${HY2_PORT:-}"; printf 'HY2_AUTH=%q\n' "${HY2_AUTH:-}"; printf 'HY2_OBFS=%q\n' "${HY2_OBFS:-}";
-    printf 'AWG_PORT=%q\n' "${AWG_PORT:-}"; printf 'AWG_SERVER_PUB=%q\n' "${AWG_SERVER_PUB:-}"; } >"$t" && mv -f "$t" "$XKIT_PROTOCOLS_ENV"
+    printf 'AWG_PORT=%q\n' "${AWG_PORT:-}"; printf 'AWG_SERVER_PUB=%q\n' "${AWG_SERVER_PUB:-}"; printf 'AWG_DEV=%q\n' "${AWG_DEV:-}"; } >"$t" && mv -f "$t" "$XKIT_PROTOCOLS_ENV"
 }
 
 proto_hy2_download() { # $1 destination
@@ -197,8 +197,17 @@ EOF
   chmod 600 "$XKIT_HY2_UNIT"
   systemctl daemon-reload && systemctl enable --now xkit-hysteria2 || { systemctl disable xkit-hysteria2 >/dev/null 2>&1 || true; rm -f "$XKIT_HY2_CONF" "$XKIT_HY2_UNIT"; return 1; }
   sleep 1; proto_service_active xkit-hysteria2 || { journalctl -u xkit-hysteria2 -n 20 --no-pager; err "Служба не запустилась — конфиг удалён, бинарник оставлен"; systemctl disable --now xkit-hysteria2 >/dev/null 2>&1 || true; rm -f "$XKIT_HY2_CONF" "$XKIT_HY2_UNIT"; return 1; }
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw allow "${HY2_PORT}/udp" >/dev/null || return 1; fi
-  proto_state_save || return 1
+  if ! xkit_fw_add hysteria2 "$HY2_PORT" udp; then
+    systemctl disable --now xkit-hysteria2 >/dev/null 2>&1 || true
+    rm -f "$XKIT_HY2_CONF" "$XKIT_HY2_UNIT"; systemctl daemon-reload
+    err 'Не удалось открыть UDP-порт Hysteria 2 — установка откачена'; return 1
+  fi
+  if ! proto_state_save; then
+    systemctl disable --now xkit-hysteria2 >/dev/null 2>&1 || true
+    xkit_fw_remove hysteria2 "$HY2_PORT" udp >/dev/null 2>&1 || true
+    rm -f "$XKIT_HY2_CONF" "$XKIT_HY2_UNIT"; systemctl daemon-reload
+    err 'Не удалось сохранить состояние Hysteria 2 — установка откачена'; return 1
+  fi
   ok "Hysteria 2 запущен: UDP ${HY2_PORT}, Salamander включён"
   proto_hy2_link
 }
@@ -216,7 +225,7 @@ proto_hy2_uninstall() {
   confirm "Остановить и удалить XKIT Hysteria 2?" || return 0
   systemctl disable --now xkit-hysteria2 >/dev/null 2>&1 || true
   rm -f "$XKIT_HY2_UNIT" "$XKIT_HY2_CONF"; systemctl daemon-reload
-  [ -n "${HY2_PORT:-}" ] && command -v ufw >/dev/null 2>&1 && ufw delete allow "${HY2_PORT}/udp" >/dev/null 2>&1 || true
+  [ -z "${HY2_PORT:-}" ] || xkit_fw_remove hysteria2 "$HY2_PORT" udp || warn 'Не удалось удалить правило XKIT Hysteria 2'
   HY2_PORT=""; HY2_AUTH=""; HY2_OBFS=""; proto_state_save
   ok "Служба и конфиг удалены; бинарник $XKIT_HY2_BIN оставлен"
 }
@@ -245,21 +254,38 @@ proto_awg_params() {
   while [ "$AWG_H4" = "$AWG_H1" ] || [ "$AWG_H4" = "$AWG_H2" ] || [ "$AWG_H4" = "$AWG_H3" ]; do AWG_H4="$(proto_rand_range 5 2147483647)"; done
 }
 
+proto_awg_rollback_install() {
+  systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true
+  xkit_awg_route_remove "${AWG_DEV:-}" >/dev/null 2>&1 || true
+  [ -z "${AWG_PORT:-}" ] || xkit_fw_remove awg "$AWG_PORT" udp >/dev/null 2>&1 || true
+  rm -f "$XKIT_AWG_CONF" "$XKIT_AWG_SYSCTL"
+}
+
 proto_awg_install() {
   require_root; load_xkit_env || die "Сначала установка XKIT"
   [ -f "$XKIT_AWG_CONF" ] && { warn 'AmneziaWG уже настроен'; return 0; }
   command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 || {
     log 'Установка официального пакета AmneziaWG из PPA...'
-    apt-get update && apt-get install -y software-properties-common python3-launchpadlib gnupg2 linux-headers-"$(uname -r)" || return 1
+    apt-get update && apt-get install -y software-properties-common python3-launchpadlib gnupg2 || return 1
+    # (мелочь №9, аудит v5.2.1): у -cloud/-HWE ядер заголовков точной версии может
+    # не быть в репо — пробуем точную, иначе generic
+    apt-get install -y "linux-headers-$(uname -r)" 2>/dev/null || {
+      warn "linux-headers-$(uname -r) недоступны в репозитории — ставлю linux-headers-generic"
+      apt-get install -y linux-headers-generic || return 1
+    }
     add-apt-repository -y ppa:amnezia/ppa && apt-get update && apt-get install -y amneziawg || return 1
   }
   local p; p="$(rand_free_port 20000 60000)" || return 1
   read -r -p "UDP-порт AmneziaWG [${p}]: " pin; p="${pin:-$p}"; is_port "$p" || return 1
-  local dev priv pub psk
+  local dev priv pub psk old_dev
   dev="$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}')"
   [[ "$dev" =~ ^[A-Za-z0-9_.-]+$ ]] || { err 'Не удалось определить внешний интерфейс'; return 1; }
+  # (баг №4, аудит v5.2.1): запоминаем прежний внешний интерфейс до перезаписи
+  old_dev=""
+  [ -n "${XKIT_PROTOCOLS_ENV:-}" ] && [ -f "$XKIT_PROTOCOLS_ENV" ] && \
+    old_dev="$(. "$XKIT_PROTOCOLS_ENV" 2>/dev/null; printf '%s' "${AWG_DEV:-}")"
   priv="$(awg genkey)" || return 1; pub="$(printf '%s' "$priv" | awg pubkey)" || return 1; psk="$(awg genpsk)" || return 1
-  AWG_PORT="$p"; AWG_SERVER_PUB="$pub"; proto_awg_params
+  AWG_PORT="$p"; AWG_SERVER_PUB="$pub"; AWG_DEV="$dev"; proto_awg_params
   mkdir -p "$(dirname "$XKIT_AWG_CONF")" "$XKIT_AWG_CLIENTS_DIR" "$(dirname "$XKIT_AWG_STATE")" || return 1
   chmod 700 "$XKIT_AWG_CLIENTS_DIR"; : >"$XKIT_AWG_STATE"; chmod 600 "$XKIT_AWG_STATE"
   local tmp; tmp="$(mktemp /tmp/.xkit-awg.XXXXXX)" || return 1
@@ -285,8 +311,19 @@ EOF
   printf 'net.ipv4.ip_forward=1\n' >"$XKIT_AWG_SYSCTL"; chmod 644 "$XKIT_AWG_SYSCTL"; sysctl --system >/dev/null
   systemctl enable --now awg-quick@awg0 || { rm -f "$XKIT_AWG_CONF"; return 1; }
   sleep 1; proto_service_active awg-quick@awg0 || { systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true; rm -f "$XKIT_AWG_CONF"; err 'AWG не запустился; конфиг удалён'; return 1; }
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then ufw allow "${AWG_PORT}/udp" >/dev/null || return 1; fi
-  proto_state_save || return 1
+  # (баг №4, аудит v5.2.1): при смене внешнего интерфейса снимаем route-правила
+  # старой пары — иначе XKIT:awg-forward остаётся на прошлом dev
+  if [ -n "$old_dev" ] && [ "$old_dev" != "$dev" ]; then
+    xkit_awg_route_remove "$old_dev" >/dev/null 2>&1 || true
+  fi
+  if ! xkit_fw_add awg "$AWG_PORT" udp || ! xkit_awg_route_add "$AWG_DEV"; then
+    proto_awg_rollback_install
+    err 'Не удалось настроить firewall/forwarding AWG — установка откачена'; return 1
+  fi
+  if ! proto_state_save; then
+    proto_awg_rollback_install
+    err 'Не удалось сохранить состояние AWG — установка откачена'; return 1
+  fi
   ok "AmneziaWG запущен: UDP ${AWG_PORT}"
   proto_awg_add
 }
@@ -354,8 +391,10 @@ proto_awg_show() {
 proto_awg_uninstall() {
   require_root; proto_state_load; confirm 'Удалить только конфигурацию XKIT AmneziaWG?' || return 0
   systemctl disable --now awg-quick@awg0 >/dev/null 2>&1 || true
-  rm -f "$XKIT_AWG_CONF" "$XKIT_AWG_SYSCTL"; [ -n "${AWG_PORT:-}" ] && command -v ufw >/dev/null 2>&1 && ufw delete allow "${AWG_PORT}/udp" >/dev/null 2>&1 || true
-  AWG_PORT=""; AWG_SERVER_PUB=""; proto_state_save
+  xkit_awg_route_remove "${AWG_DEV:-}" || warn 'Не удалось удалить route-правила XKIT AWG'
+  rm -f "$XKIT_AWG_CONF" "$XKIT_AWG_SYSCTL"
+  [ -z "${AWG_PORT:-}" ] || xkit_fw_remove awg "$AWG_PORT" udp || warn 'Не удалось удалить входящее правило XKIT AWG'
+  AWG_PORT=""; AWG_SERVER_PUB=""; AWG_DEV=""; proto_state_save
   ok 'Служба XKIT AWG удалена; пакеты и клиентские конфиги сохранены'
 }
 proto_awg_menu() {

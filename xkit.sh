@@ -1,344 +1,22 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v5.2.0 — TUI + профили доступа для nginx + 3X-UI (Ubuntu 24.04+)
-#  Похож на родное меню x-ui: зашёл по SSH — меню само (или наберите `xkit`).
+#  XKIT v5.3.1 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
-#  ГЛАВНОЕ:
-#   • установка ОДНИМ ШАГОМ: 3X-UI + nginx + SSL + панель за nginx
-#     (панель на 127.0.0.1, порт наружу не светится)
-#   • ПУНКТ 2 — сам находит ВСЕ инбаунды через API панели, переводит их
-#     на 127.0.0.1 и сам прописывает маршруты в nginx (ws/grpc/xhttp/
-#     httpupgrade); Reality/UDP/raw-TCP помечает «direct» и не трогает
-#   • пользователи: создать / удалить / список (через API панели)
-#   • ПОДПИСКИ: xkit сам формирует ссылки вида https://ДОМЕН:443/путь
-#     (а не 127.0.0.1:порт) и раздаёт их по секретному адресу /s-<token>/
-#   • проверка жизнеспособности: сервисы, пути, серты, «что светится наружу»
-#   • бэкапы: БД панели + конфиг nginx + серты + подписки, авто по cron
+#  Установка:  curl -fsSL https://raw.githubusercontent.com/kalsifar/xkit/main/install.sh | sudo bash
+#  Запуск:     xkit (TUI) | xkit --classic | xkit help
+#  Документация: README.md
+#  История:      CHANGES.md
 #
-#  НОВОЕ В v4.1:
-#   • НОДЫ: подключение зарубежного сервера прямо из меню по SSH (ставим
-#     3X-UI, создаём VLESS+Reality туннель, ufw), реестр нод, аутбаунды на
-#     мастере, xray balancer (roundRobin/random/leastPing/leastLoad +
-#     observatory): «главный сервер -> туннель до нод с умной балансировкой»
-#   • REALITY: свой сайт-прикрытие с сертификатом (dest на свой домен),
-#     скан подсети на подходящие dest (TLS1.3/H2/X25519/не self-signed),
-#     готовый список проверенных dest, by-IP, показ ключей
-#   • externalProxy + нативные подписки 3X-UI через nginx: ссылки и sub URL
-#     В САМОЙ панели корректные (https://ДОМЕН:443/...), а не 127.0.0.1
-#   • сброс трафика пользователя; авто-меню xkit при входе по SSH (вкл/выкл)
+#  ВНИМАНИЕ (v5.3.1): этот файл СОБИРАЕТСЯ из src/ командой `bash build.sh` —
+#  правки вносить в src/[0-9][0-9]_*.sh, а не сюда (§8.3 CHANGES.md).
 #
-#  НОВОЕ В v4.2 (закрытие находок аудита безопасности):
-#   • ufw на ноде: публичный IP валидируется (is_ip) и передаётся через env —
-#     подмена ответа api.ipify.org больше не даёт RCE на ноде
-#   • SSH к нодам: accept-new + постоянный known_hosts (MITM не пройдёт),
-#     fingerprint ключа показывается при добавлении; пароль не светится в ps (sshpass -e)
-#   • панель ноды: самоподписанный HTTPS — креды панели не ходят по HTTP
-#   • фикс: реестр нод сохранялся в несуществующую переменную (KIT_NODES) —
-#     ноды не запоминались между запусками
-#   • ссылки подписок: path/host/sni URL-энкодятся; локейшн подписок:
-#     Referrer-Policy no-referrer + access_log off
-#   • скан Reality: цепочка сертификата проверяется openssl (CN==issuer — не критерий)
-#   • extfix: Reality/прямые инбаунды не перезаписываются + подтверждение
-#   • is_domain: TLD обязан содержать букву; email пользователя санитизируется
-#   • `xkit update [URL]` — обновление из репозитория с проверкой SHA-256 и бэкапом
-#
-#  НОВОЕ В v4.3 (аудит №2: регрессии и дыры + ВЕБ-ДАШБОРД):
-#   • КРИТИЧНО: ufw на ноде — все переменные через env (NPORT/TP/NPP), set -u + :?
-#     и без глушения вывода. Раньше правила молча падали (quoted-heredoc), а
-#     ufw enable с пустыми правилами отрезал SSH/туннель — «bricking» ноды
-#   • скан Reality (мастер и нода): ЛЮБОЙ провал проверки цепочки сертификата
-#     = кандидат непригоден. Раньше «строки verify нет» трактовалось как «годен»
-#   • `xkit update` без аргументов работает из свежей SSH-сессии (читает xkit.env)
-#   • nodes_ensure_pool: провал применения конфига = ошибка (не маскируется),
-#     старый маршрут pool удаляется из routes.tsv (осиротевший location)
-#   • в финале node_add — реальная схема панели ноды ($psch), а не захардкоженный http
-#   • mktemp для установщиков 3X-UI (мастер и нода); install.sh: проверка
-#     плейсхолдера YOUR_USERNAME + чистка временного каталога (без exec)
-#   • v3: дефолтный сайт nginx сносится только ПОСЛЕ успешного reload;
-#     бэкап проверяется tar tzf; установщик 3X-UI в mktemp
-#   • new_uuid: корректный fallback 8-4-4-4-12; trap-чистка временных файлов скана
-#
-#  ВЕБ-ДАШБОРД (пункт 23 / xkit dash):
-#   • секретная страница рядом с панелью: https://ДОМЕН/d-<токен>/ (noindex,
-#     no-referrer, no-store, access_log off, опционально allow IP)
-#   • статусы нод и каналов (туннель: TCP-проба + латентность; панель ноды)
-#   • потреблённый трафик: инбаунды мастера, по нодам, топ-10 пользователей
-#   • СРОКИ АРЕНДЫ серверов отдельным параметром (expiry.tsv): мастер и ноды,
-#     дни до конца аренды в CLI (xkit expiry) и на дашборде; cron каждые 5 минут
-#
-#  НОВОЕ В v4.4 (аудит №3: дыры дашборда/expiry + реквизиты):
-#   • КРИТИЧНО: ufw на ноде — если IP мастера не определён, панель ноды
-#     ЗАКРЫВАЕТСЯ (ufw deny NPP/tcp), а не остаётся открытой в интернет
-#   • КРИТИЧНО: data.json дашборда санитизируется — БЕЗ privateKey Reality,
-#     UUID/subId клиентов (раньше утекал полный JSON инбаундов)
-#   • Basic Auth на дашборде: случайные логин/пароль (как у панели ноды)
-#   • права: /var/lib/xkit и dash-каталог 750 root:www-data, файлы 640
-#   • dash_gen: flock в subshell (cron не блокируется открытым меню);
-#     при недоступной панели прошлые данные НЕ затираются (stale)
-#   • nodes_ensure_pool: early-return только если nginx знает маршрут pool;
-#     `xkit nodes repair` — переприменение конфигурации после сбоя apply
-#   • пин сертификата панели ноды (sha256, --pinnedpubkey) + `xkit nodes repin`
-#   • human_bytes одна (IEC, B/KiB/MiB/GiB/TiB); _dash_ips local + CIDR в allow
-#   • expiry: flock при записи, заметка без табов; `xkit dash rotate`
-#   • СВОДКА после установки: терминал + /root/xkit-info.txt (chmod 600)
-#
-#  НОВОЕ В v4.4.1 (аудит №4: хвосты дашборда):
-#   • КРИТИЧНО: stale-ветка dash_gen санитизирует данные при ЧТЕНИИ — апгрейд
-#     v4.3 (raw data.json с privateKey) + падение панели до первого успешного
-#     gen больше не возвращает утечку; плюс финальный sanitize перед записью
-#   • трафик нод и totals мастера: total = up+down (потрачено), а не квота .total
-#   • dash_rotate: при сбое apply откатываются и env, и htpasswd — старые
-#     реквизиты остаются рабочими (рассинхрон URL↔nginx больше не возможен)
-#   • пароли по умолчанию НЕ печатаются в stdout (xkit info): маска + подсказка
-#     «cat /root/xkit-info.txt»; полные — только в файл 600 (scrollback/tee/logi
-#     больше не собирают пароли); после установки реквизиты по-прежнему видны
-#   • dash_fix_perms: группа nginx берётся через id -gn (CentOS/кастомные
-#     сборки), при неудаче — явный warn; права 750 сразу, без окна 755;
-#     файлы пишутся с umask 027 (сразу 640, а не 644 до dash_fix_perms)
-#   • node_repin: смена пина требует подтверждения (TOFU: молча принять новый
-#     пин после компрометации = легитимизировать MITM); без tty пин не меняется
-#
-#  НОВОЕ В v4.4.2 (хвост аудита №4 — dash_sanitize_inbounds):
-#   • clients считается корректно для ВСЕХ форматов: raw API (клиенты внутри
-#     settings-строки), settings-объект, .clients-массив (полу-sanitized),
-#     .clients-число (sanitized), null/битое -> 0. Прежний else-вариант молча
-#     давал 0 для полу-sanitized-массива; наивный «elif null -> 0» из ревью
-#     сломал бы raw (у raw нет поля .clients — детект через .settings)
-#   • функция всегда возвращает валидный JSON-массив (пустой вход jq раньше
-#     давал пустой вывод с кодом 0 — теперь явный fallback на [])
-#   • enable:false больше не теряется: «// true» в jq считает false пустым
-#     значением — выключенный инбаунд/пользователь на дашборде показывался
-#     как включённый (inbounds, users, whitelist — if enable==null)
-#   • комментарий-предохранитель у umask 027 в dash_gen_locked (не выносить
-#     из subshell — иначе маска 640 утечёт в интерактивную сессию)
-#
-#  НОВОЕ В v4.5 (удобство: режимы, pool-симметрия, Telegram):
-#   • nodes_del: удаление ПОСЛЕДНЕЙ ноды убирает pool-инбаунд целиком (панель +
-#     маршрут + env + перегенерация подписок). Раньше pool оставался, а правило
-#     balancer уже исчезало из шаблона xray: ссылки пула продолжали работать,
-#     молча меняя выход на IP мастера. Плюс «НОДЫ -> 8) убрать pool» — явный
-#     возврат в одиночный режим (pool_remove_force: и из nodes_del, и из меню)
-#   • auto_route помечает pool-инбаунд как POOL и не трогает его (раньше
-#     отображался как обычный «ЗА nginx»)
-#   • конец установки: развилка «1) одиночный / 2) мастер с нодами / 3) позже»
-#     вместо одного вопроса про автопроброс (вариант 2 = автопроброс + nodes_menu)
-#   • «Режим: одиночный/мастер (N нод)» в xkit info, xkit status, шапке меню
-#     и на дашборде (баннер одиночного режима; поле mode в data.json)
-#   • TELEGRAM-алерты (xkit telegram setup): только то, чего 3X-UI НЕ знает —
-#     ноды упали/восстановились (гистерезис: алерт со 2-й проверки подряд,
-#     одно сообщение на восстановление), аренда <=7 дн. и истёкшая (дедуп:
-#     алерт при смене числа дней = максимум раз в сутки), сертификат <=14 дн.,
-#     дашборд stale (>25 мин без обновления). Бот-команды и уведомления о
-#     клиентах НЕ дублируем — это умеет 3X-UI.
-#     Доставка: (1) напрямую с мастера, (2) при неудаче — через ноды по SSH
-#     (curl на ноде, выход с её IP — решает недоступность api.telegram.org
-#     с мастера). Выбор ноды балансировщиком не нужен: сообщение одно и то же,
-#     идём по реестру до первой доставки. Токен не попадает в argv: curl
-#     читает URL из stdin-конфига (-K -). Cron каждые 10 минут (/etc/cron.d/
-#     xkit-notify); состояние алертов — ${XKIT_DIR}/notify.state (chmod 600)
-#
-#  НОВОЕ В v4.6.0 (аудит №5 + наблюдения эксплуатации):
-#   • БЕЗОПАСНОСТЬ: все TCP-пробы /dev/tcp (5 мест) переведены на безопасный
-#     bash -c '..."$1"...' _ host port — хост/порт больше не интерполируются в
-#     командную строку (инъекция при ручной правке nodes.json); SSH-пользователь
-#     ноды валидируется ^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$; install-result.env
-#     парсится БЕЗ source (sed, аудит №8); /etc/xkit = 0700 ДО ssh-keygen
-#   • nodes_health: SSH-провал считается отдельным счётчиком — финал честный
-#     («Туннели живы, но SSH недоступен на N нодах»), а не «Все ноды живы»
-#   • nodes_ensure_pool: старый pool-инбаунд удаляется ИЗ ПАНЕЛИ (новый
-#     api_del_inbound, 3x-ui POST /panel/api/inbounds/del/:id), а не только
-#     маршрут nginx — сироты больше не копятся; при сбое apply сообщение
-#     говорит, что будет с pool-инбаундом при повторе
-#   • sub_regen под flock (аудит №5): cron «13 * * * * xkit sub -q» и ручной
-#     запуск не пересекаются — нет окна 404/битого base64; второй процесс
-#     non-blocking пропускает
-#   • dash_rotate: откат htpasswd — КОПИРОВАНИЕМ из бэкапа (пересчёт openssl мог
-#     упасть и оставить новый пароль при старом env, аудит №6); сбой
-#     save_xkit_env после успешного apply кричит явно (№13); при сбое записи
-#     htpasswd откатываются ВСЕ реквизиты, а не только токен
-#   • rand_str: длина гарантирована (запас входа x3 + доводка), SIGPIPE-хрупкость
-#     убрана, энтропия base64 сохранена (аудит №9); is_ipv6 -> inet_pton через
-#     python3 с фолбэком (№10); nodes_load отбрасывает битый nodes.json
-#     ([] + warn в stderr, №11); notify_state_set удаляет ключи awk'ом —
-#     симметрично get, ключи с «.» безопасны (№14)
-#   • python3 в списке пакетов установки + понятная ошибка в
-#     nodes_merge_template/reality_expand_targets (№15); предупреждение, если
-#     креды панели не извлечены из install-result.env (№17)
-#   • АЛЕРТЫ (telegram check): СЕРВИСЫ мастера (nginx/x-ui упал/восстановился,
-#     гистерезис как у нод) и ДИСК (>=85% предупреждение, >=95% тревога,
-#     «место освободилось»; дедуп по уровню) — раньше мастер сообщал только о
-#     нодах, а переполнение диска молча валило sqlite/certbot/бэкапы
-#   • IPv6 (А3): при наличии глобального v6-адреса nginx слушает и [::]:443/80
-#     (v6-only клиенты за CGNAT раньше не могли подключиться вовсе);
-#     XKIT_V6_LISTEN=0|1|auto — принудительный режим
-#   • ревью v4.6.0 (до релиза): IPv6-listen генерировался как «listen [::] 443»
-#     БЕЗ двоеточия — nginx -t падал и откатывал ЛЮБОЙ apply_config на серверах
-#     с глобальным v6; теперь [::]:443/[::]:80 валидны, «http2 on;» не
-#     дублируется; notify_state_set пишет в subshell (umask не утекает при
-#     сбоях), xui_env_val парсит awk'ом (ключ с метасимволами безопасен)
-#
-#  НОВОЕ В v5.2.0 (TUI + протоколы):
-#   • отдельный полноэкранный TUI (Go/Bubble Tea), amd64/arm64; стрелки, поиск,
-#     живой snapshot, запуск штатных CLI-команд; XKIT_TUI=0 и xkit --classic —
-#     прежнее Bash-меню, pipe/cron автоматически используют fallback
-#   • xkit protocols: VLESS+REALITY+Vision, новый VLESS+XHTTP+REALITY,
-#     AmneziaWG и Hysteria 2 как отдельные systemd-службы; list/status --json
-#   • Hysteria 2: официальный release asset + hashes.txt, SHA-256 обязателен;
-#     Salamander, клиентская hy2://-ссылка, UFW и безопасные права
-#   • AmneziaWG: официальный PPA, отдельные клиентские конфиги 600, стабильный
-#     J/S/H-профиль без экспериментальных I1-I5; peer apply с откатом
-#   • xkit snapshot — санитизированный JSON для TUI (без ключей и паролей)
-#
-#  НОВОЕ В v5.1.0 (security-релиз: подтверждённое из аудита №1 + P0/P1 аудита №2):
-#   • K-01 КРИТИЧНО: nginx-конфиг собирается ТОЛЬКО из провалидированных значений:
-#     is_nginx_path (запрет ~, .., //, *) для путей, строгий parse_hostport
-#     ([v6]:port; заодно чинит IPv6-таргеты/F-3), is_port для PANEL_PORT.
-#     Невалидное = отказ маршрута, а не «нормализация»
-#   • K-02 КРИТИЧНО: supply chain fail-closed — без xkit.sh.sha256 установка
-#     (install.sh) и обновление (xkit update/докачка меню) ОТМЕНЯЮТСЯ;
-#     осознанный обход: XKIT_ALLOW_UNVERIFIED=1. http://-источники наружу
-#     запрещены (localhost-зеркала — можно). Установщик 3X-UI — по тегу
-#     последнего релиза (не master) + bash -n скачанного
-#   • V-01: TARGETS уходит на ноду base64'ом (вне shell-строки) + валидация
-#     токенов в reality_expand_targets
-#   • V-02: меню грузится только из доверенных мест (root-владелец, без
-#     group/world-write; /tmp, /var/tmp, /dev/shm — чёрный список)
-#   • V-03: секреты ушли из argv: логин панели и node_api через --data @-
-#     (stdin), nodes.json в python3 через tmpfile 600, openssl passwd -stdin
-#   • V-05: SSH TOFU с подтверждением — отпечаток ключа ноды показывается и
-#     подтверждается ДО первой отправки пароля (node_ssh_host_key)
-#   • V-06: восстановление бэкапа — проверка членов tar, symlink'ов наружу и
-#     командных подстановок в xkit.env; чужой архив — только через YES
-#   • S-03: порт SSH из sshd -T/sshd_config; не определили — UFW не включаем
-#   • v3: mktemp вместо /tmp/.xmesh_nginx_t (V-04); exit_ip/pbk ноды
-#     валидируются (S-05/№10); ACTIVE на удалённой ноде -> block (№3);
-#     бэкап юнита (№23); symlink-члены tar при restore (№15); подписки
-#     750/640 (S-04); пароли панели нод через stdin (V-03); TOFU-подтверждение
-#     при установке ключа (V-05); 3X-UI на ноде по тегу (K-02)
-#   • дашборд: смешанный формат stale-данных больше не теряет пользователей (№1);
-#     ротация отменяется при неудачном бэкапе htpasswd (№4); is_ipv6 без
-#     python3 — через getent (№7/N-04)
-#   • мелочи: api_del_inbound вместо сырого del/ (№2), валидация TG-токена из
-#     env (№9), tonumber в client_list (№12), warn при нестандартном hosts/list
-#     (№18), dirname вместо %/* (№19), ранний фолбэк XKIT_REPO_URL (№22),
-#     ::ffff:127.0.0.1 в проверке «светится наружу» (№24), честные rc у
-#     xkit_menu_fetch/install (F-1/F-2)
-#
-#  НОВОЕ В v5.0.0 (модульное меню):
-#   • МЕНЮ ПЕРЕРАБОТАНО: плоский список из 26 пунктов собран в 6 групп с
-#     подменю — 1) Установка и настройка 2) ПОЛЬЗОВАТЕЛИ (создать/удалить/
-#     список/сброс трафика/подписки — раньше раскидано по пунктам 3-6 и 20)
-#     3) Reality 4) НОДЫ 5) Обслуживание (серт/health/статус/бэкап/обновление)
-#     6) Мониторинг (дашборд/Telegram/аренда/SSH-хук/реквизиты). Главное меню
-#     помещается в один экран
-#   • МЕНЮ ВЫНЕСЕНО В ОТДЕЛЬНЫЙ ФАЙЛ xkit_menu.sh: UI-слой больше не раздувает
-#     xkit.sh (ядро: API, установка, nginx, ноды, дашборд — не тронуто).
-#     xkit.sh ищет модуль рядом с собой, затем в /usr/local/lib/xkit,
-#     /usr/local/bin и /etc/xkit; при отсутствии — сам докачивает с репо
-#     (XKIT_REPO_URL) со сверкой SHA-256
-#   • install.sh и `xkit update` качают ОБА файла; пломба xkit.sh.sha256 —
-#     формат sha256sum, 2 строки (старые версии читают первую строку —
-#     обновление с v4.x работает без переустановки)
-#   • uninstall чистит /usr/local/lib/xkit; one_step_install/
-#     hide_existing_panel/ssh_hook_toggle обновляют модуль меню вместе
-#     с командой xkit
-#
-#  НОВОЕ В v4.9.1 (совместимость с 3X-UI v3.x — инсталлятор уже ставит 3.11):
-#   • КРИТИЧНО: «Не удалось войти в API панели» сразу после свежей установки
-#     (пункт 2 и все пункты с API). Причина: 3X-UI v3 закрыл ВСЕ POST-запросы
-#     CSRF-мiddleware'ом — без заголовка X-CSRF-Token панель отвечает 403 с
-#     ПУСТЫМ телом (выглядит как «панель не отвечает», в ответе нет «Ответ:»).
-#     Теперь xkit действует как браузер: GET <base>/csrf-token (создаёт сессию
-#     и возвращает токен) → POST /login с X-CSRF-Token; заголовок ставится и во
-#     ВСЕ POST-запросы к /panel/api/*. На 3X-UI v2.x ничего не ломается:
-#     роута csrf-token там нет — xkit работает по-старому
-#   • 3X-UI v3 перенёс эндпоинты: клиенты теперь /panel/api/clients/
-#     {add|del/:email|resetTraffic/:email} (в v2: inbounds/addClient,
-#     inbounds/:id/delClient/:cid — УДАЛЕНЫ в v3), настройки —
-#     /panel/api/setting/*, xray-шаблон — POST /panel/api/xray/ + /update
-#     (xrayTemplateConfig из settings в v3 ВЫВЕДЕН — чтение через старый
-#     endpoint возвращало пустоту, и nodes_apply_template затирал бы конфиг).
-#     xkit определяет поколение API (GET /panel/api/openapi.json есть только
-#     в v3) и шлёт запросы в нужном формате: работают И v3.11, И v2.x
-#   • externalProxy в v3 заменён на host-группы: пункт 19 (extfix), Reality-
-#     inbound и pool-инбаунд нод на v3 создают запись /panel/api/hosts
-#     (remark "xkit", апдейт по groupId — без дублей при повторном запуске)
-#   • kit_login различает: панель не отвечает (curl exit) / 403 (CSRF —
-#     устаревший xkit, подсказка «xkit update») / неверные логин-пароль
-#     (HTTP-код + тело ответа)
-#
-#  НОВОЕ В v4.9.0 (замечания с живой установки):
-#   • ВЫБОР АДРЕСА показывает реальный IP: определённый pubip выводится как
-#     пункт 1 («IP этого сервера — 1.2.3.4»), Enter = согласиться, 2 = свой
-#     домен/другой IP. Раньше адрес просили набрать вслепую — реальный IP
-#     на экране не показывался
-#   • certbot >= 5.3 ставится СРАЗУ (шаг 1/7, после apt): в репо Ubuntu 24.04
-#     certbot 2.9 без --ip-address, и раньше это всплывало вопросом посреди
-#     установки и могло её оборвать. Теперь pip/venv-обновление — неинтерактивно
-#     в начале; в issue_cert_le_ip вопрос убран, авто-попытка без вопросов
-#   • ПРОВАЛ выпуска серта больше НЕ выбрасывает из установки: меню
-#     сертификата показывается снова (до 5 попыток; EOF/Ctrl-D = пункт 4,
-#     самоподписанный — работает всегда). Раньше return 1 из issue_cert_le_ip
-#     обрывал one_step_install и выкидывал админа в консоль
-#   • Email для Let's Encrypt спрашивается только для пунктов 1/3 (раньше —
-#     для всех, включая самоподписанный и свои файлы)
-#   • install.sh: ник репозитория вписан сразу (kalsifar) — установка одной
-#     строкой работает без правки install.sh
-#
-#  НОВОЕ В v4.8.0 (правки финального ревью №2 + GitHub-инструкция):
-#   • node_add: EOF (Ctrl-D) на ЛЮБОМ вводе — отмена, а не молчаливое
-#     продолжение с дефолтами 22/root и попыткой коннекта к ноде
-#     (симметрия с v3.2.1; раньше EOF на порту/юзере проходил незаметно)
-#   • install.sh: -y/--force доезжают до xkit при запуске НЕ от root —
-#     явный проброс XKIT_YES/XKIT_FORCE/XKIT_NO_COLOR/XKIT_NO_ANIM/
-#     XKIT_REPO_URL через `sudo env` (sudo сам env не наследует, env_keep
-#     зависит от sudoers); root-путь (curl | sudo bash -s -- -y) — через export
-#   • install.sh: warn() тоже в stderr (симметрия с xkit.sh) — диагностика
-#     не попадает в пайпы/захват stdout
-#   • GITHUB_SETUP.md — пошаговая инструкция: как выложить файлы на GitHub,
-#     чтобы работала установка одной строкой (curl | sudo bash), включая
-#     sha256-канал для `xkit update` и обновление версий
-#
-#  НОВОЕ В v4.7.0 (ревью UX + переустановка):
-#   • ПОВТОРНЫЙ `xkit install` на установленном сервере больше не «ставит
-#     поверх молча»: preflight обнаруживает /etc/xkit/xkit.env и предлагает
-#     меню — 1) обновить скрипт (xkit update, состояние не трогается)
-#     2) ЧИСТУЮ переустановку (бэкап -> полное удаление -> установка с нуля)
-#     3) накатить поверх (с честным предупреждением, ЧТО слетит).
-#     Раньше: env не загружался -> НОВЫЙ SUB_TOKEN (все ссылки подписок
-#     ломались) + save_xkit_env затирал TG/dash-токены нулями
-#   • `xkit uninstall [--full]`: бэкап ОБЯЗАТЕЛЕН перед удалением (провал
-#     бэкапа = отмена); удаляет cron'ы, nginx-сайт, /etc/xkit, /var/lib/xkit,
-#     htpasswd даша; --full дополнительно сносит 3X-UI и /etc/nginx/ssl.
-#     Бэкапы (/var/backups/xkit) и letsencrypt сохраняются ВСЕГДА.
-#     `xkit reinstall` = бэкап -> uninstall --full -> one_step_install
-#   • ЖИВОЙ UX установки: цвета гаснут при не-TTY (curl|bash не мусорит
-#     ANSI-кодами в логи), спиннер вокруг apt-get/детекта схемы панели/webListen
-#     (было 20-60 сек тишины), индикатор шагов [n/7], полный лог установки
-#     /var/log/xkit-*.log (600) с подсказкой в ошибках
-#   • preflight ДО изменений: занятые порты 80/443 (с именами процессов),
-#     свободное место (<500MB = отказ), RAM (<400MB = предупреждение),
-#     доступ к сети; подтверждение при предупреждениях
-#   • confirm()-хелпер и XKIT_YES=1: неинтерактивный режим (CI/cloud-init);
-#     install.sh пробрасывает -y/--yes и --force; trap INT/TERM во время
-#     установки чистит временные файлы и подсказывает путь к логу
-#   • фикс по итогам ревью v4.7.0: warn() теперь пишет в stderr — раньше
-#     warn внутри detect_panel_scheme попадал в захват $(with_spinner -o),
-#     и PANEL_SCHEME превращался в "[WARN] …\nhttp", ломая api_url;
-#     лог reinstall больше не затирается фазой установки (один общий файл
-#     xkit-reinstall-*.log); uninstall --full сбрасывает failed-статус x-ui
-#
-#  После установки команда `xkit` доступна в SSH (меню как у 3X-UI).
-#  Для cron/скриптов есть субкоманды: xkit route|sub|health|backup|restore|status
-#
-#  Тестирование функций без запуска меню: source xkit.sh (main вызывается
-#  только при прямом запуске).
+#  Для тестов функций: source xkit.sh — main вызывается только при прямом запуске.
 #==============================================================================
 
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="5.2.0"
+XKIT_VERSION="5.3.1"
 # TTY-детект (ревью v4.7.0): при не-терминале (curl|bash, cron, tee, CI) цвета
 # гаснут — в логах не остаётся сырых \033[… кодов. XKIT_NO_COLOR=1 — ручной
 # override; XKIT_NO_ANIM=1 отключает спиннер при живом TTY
@@ -493,6 +171,7 @@ XKIT_ROUTES="${XKIT_DIR}/routes.tsv"
 XKIT_NODES="${XKIT_DIR}/nodes.json"
 XKIT_EXPIRY="${XKIT_DIR}/expiry.tsv"     # сроки аренды: scope<TAB>id<TAB>date<TAB>note
 XKIT_DASH_DIR="/var/lib/xkit/dash"        # веб-дашборд (index.html + data.json)
+XKIT_NODES_METRICS="${XKIT_NODES_METRICS:-/var/lib/xkit/nodes-metrics.json}" # общий кэш TUI/дашборда
 XKIT_DASH_HTPASSWD="/etc/nginx/.xkit-dash.htpasswd"  # Basic Auth дашборда
 XKIT_INFO_FILE="/root/xkit-info.txt"      # сводка-реквизиты (терминал + файл)
 XKIT_NOTIFY_STATE="${XKIT_DIR}/notify.state"  # состояние Telegram-алертов (гистерезис/дедуп)
@@ -511,6 +190,76 @@ XKIT_CONF="/etc/nginx/sites-available/xkit.conf"
 XKIT_CONF_LINK="/etc/nginx/sites-enabled/xkit.conf"
 XUI_RESULT="/etc/x-ui/install-result.env"
 XUI_DB="/etc/x-ui/x-ui.db"
+
+#=========================== FIREWALL: ТОЛЬКО ПРАВИЛА XKIT ======================
+xkit_ufw_active() {
+  local st
+  command -v ufw >/dev/null 2>&1 || return 1
+  st="$(ufw status 2>/dev/null)" || return 1
+  grep -q '^Status: active' <<<"$st"
+}
+
+xkit_fw_rule_line() { # $1 port, $2 proto, $3 owner
+  [[ "$1" =~ ^[0-9]+$ ]] && is_port "$1" || return 1
+  [[ "$2" =~ ^(tcp|udp)$ && "$3" =~ ^[a-z0-9-]+$ ]] || return 1
+  ufw status 2>/dev/null | grep -E "^${1}/${2}[[:space:]]+ALLOW[[:space:]].*XKIT:${3}([[:space:]]|$)"
+}
+
+xkit_fw_add() { # $1 owner, $2 port, $3 tcp|udp; чужой allow не трогаем
+  local owner="$1" port="$2" proto="$3"
+  [[ "$owner" =~ ^[a-z0-9-]+$ && "$proto" =~ ^(tcp|udp)$ ]] || return 1
+  is_port "$port" || return 1
+  xkit_ufw_active || return 0
+  xkit_fw_rule_line "$port" "$proto" "$owner" >/dev/null && return 0
+  # Уже существующее общее разрешение считаем внешним: повторять/удалять его не надо.
+  if ufw status 2>/dev/null | grep -E "^${port}/${proto}[[:space:]]+ALLOW[[:space:]]" >/dev/null; then
+    return 0
+  fi
+  ufw allow "${port}/${proto}" comment "XKIT:${owner}" >/dev/null || return 1
+  xkit_fw_rule_line "$port" "$proto" "$owner" >/dev/null
+}
+
+xkit_fw_remove() { # $1 owner, $2 port, $3 tcp|udp; без метки XKIT — не удаляем
+  local owner="$1" port="$2" proto="$3"
+  [[ "$owner" =~ ^[a-z0-9-]+$ && "$proto" =~ ^(tcp|udp)$ ]] || return 1
+  is_port "$port" || return 1
+  xkit_ufw_active || return 0
+  xkit_fw_rule_line "$port" "$proto" "$owner" >/dev/null || return 0
+  ufw delete allow "${port}/${proto}" comment "XKIT:${owner}" >/dev/null || return 1
+  ! xkit_fw_rule_line "$port" "$proto" "$owner" >/dev/null
+}
+
+xkit_awg_route_add() { # $1 внешний интерфейс
+  local dev="$1"
+  [[ "$dev" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  xkit_ufw_active || return 0
+  if ufw status 2>/dev/null | grep -F 'XKIT:awg-forward' >/dev/null; then
+    # (баг №4, аудит v5.2.1): сверяем пару awg0 -> $dev, а не «любое XKIT-правило»;
+    # при смене внешнего интерфейса (eth0 -> eth1) старая пара снимается, иначе
+    # новый интерфейс навсегда остаётся закрытым
+    if ufw status 2>/dev/null | grep -F 'XKIT:awg-forward' | grep -F -- "on $dev" | grep -F 'awg0' >/dev/null; then
+      return 0
+    fi
+    local od
+    od="$(ufw status 2>/dev/null | grep -F 'XKIT:awg-forward' | sed -n 's/.*out on \([^ ]*\).*/\1/p' | head -n1)"
+    [ -n "$od" ] && xkit_awg_route_remove "$od" >/dev/null 2>&1 || true
+  fi
+  ufw route allow in on awg0 out on "$dev" comment 'XKIT:awg-forward' >/dev/null || return 1
+  ufw route allow in on "$dev" out on awg0 comment 'XKIT:awg-forward' >/dev/null || {
+    ufw delete route allow in on awg0 out on "$dev" comment 'XKIT:awg-forward' >/dev/null 2>&1 || true
+    return 1
+  }
+}
+
+xkit_awg_route_remove() { # $1 сохранённый внешний интерфейс
+  local dev="$1"
+  [[ "$dev" =~ ^[A-Za-z0-9_.-]+$ ]] || return 0
+  xkit_ufw_active || return 0
+  if ufw status 2>/dev/null | grep -F 'XKIT:awg-forward' >/dev/null; then
+    ufw delete route allow in on awg0 out on "$dev" comment 'XKIT:awg-forward' >/dev/null 2>&1 || true
+    ufw delete route allow in on "$dev" out on awg0 comment 'XKIT:awg-forward' >/dev/null 2>&1 || true
+  fi
+}
 
 #=========================== ВАЛИДАЦИЯ ВВОДА ==================================
 is_domain() {
@@ -888,10 +637,17 @@ install_cert_files() {
   local h="$1" src="/root/cert/$h" dest="/etc/nginx/ssl/$h"
   [ -f "$src/fullchain.pem" ] && [ -f "$src/privkey.pem" ] \
     || { err "Не найдены $src/fullchain.pem и/или $src/privkey.pem"; return 1; }
-  # серт и ключ должны быть парными (одинаковый публичный ключ)
-  [ "$(openssl x509 -noout -pubkey -in "$src/fullchain.pem" 2>/dev/null | sha256sum | awk '{print $1}')" = \
-    "$(openssl pkey -pubout -in "$src/privkey.pem" 2>/dev/null | sha256sum | awk '{print $1}')" ] \
-    || { err "fullchain.pem и privkey.pem не парные (разные ключи)"; return 1; }
+  # серт и ключ должны быть парными (одинаковый публичный ключ). (з.7/з.11,
+  # аудит v5.2.1): пустой вывод openssl (битые файлы) парностью не считается —
+  # иначе «пусто == пусто» проходило как пара
+  local _pk1 _pk2
+  _pk1="$(openssl x509 -noout -pubkey -in "$src/fullchain.pem" 2>/dev/null)" \
+    || { err "fullchain.pem не читается как сертификат (openssl)"; return 1; }
+  _pk2="$(openssl pkey -pubout -in "$src/privkey.pem" 2>/dev/null)" \
+    || { err "privkey.pem не читается как приватный ключ (openssl)"; return 1; }
+  [ -n "$_pk1" ] && [ -n "$_pk2" ] \
+    && [ "$(sha256sum <<<"$_pk1" | awk '{print $1}')" = "$(sha256sum <<<"$_pk2" | awk '{print $1}')" ] \
+    || { err "fullchain.pem и privkey.pem не парные (разные или битые ключи)"; return 1; }
   mkdir -p "$dest"
   cp "$src/fullchain.pem" "$dest/fullchain.pem"
   cp "$src/privkey.pem"  "$dest/privkey.pem"
@@ -1189,6 +945,9 @@ install_3xui_auto() {
   curl -fsSL -o "$dl" "$u" \
     || { rm -f "$dl"; die "Не удалось скачать установщик 3X-UI (проверьте сеть)"; }
   bash -n "$dl" || { rm -f "$dl"; die "Скачанный установщик 3X-UI не проходит bash -n — отмена (K-02)"; }
+  # (з.6, аудит v5.2.1): установка бежит от root — явное подтверждение, симметрия с node_add
+  confirm "Запустить официальный установщик 3X-UI от root? [Y/n] " y \
+    || { rm -f "$dl"; warn "Установка 3X-UI отменена"; return 1; }
   log "Устанавливаю 3X-UI в неинтерактивном режиме (случайные креды)..."
   if ! XUI_NONINTERACTIVE=1 bash "$dl" </dev/null; then
     rm -f "$dl"
@@ -2264,8 +2023,10 @@ client_list() {
       totalgb="$(jq -r '.totalGB // 0 | (tonumber? // 0)' <<<"$cl")"
       exp="$(jq -r '.expiryTime // 0' <<<"$cl")"
       up=0; down=0
-      up="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | (.up|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
-      down="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (.clientStats // []) end)[]? | select(.email==$e) | (.down|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
+      # (баг №1, аудит v5.2.1): в else-ветке точка УЖЕ равна значению .clientStats
+      # (массив); обращение .clientStats к массиву давало null -> трафик всегда 0
+      up="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (. // []) end)[]? | select(.email==$e) | (.up|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
+      down="$(jq -r --arg e "$email" '[(.clientStats | if type=="string" then (fromjson? // []) else (. // []) end)[]? | select(.email==$e) | (.down|tonumber? // 0)] | add // 0' <<<"$ib" 2>/dev/null)"
       used="$(human_bytes $((up+down)))"
       printf '   %-26s %-12s %-10s %-11s %s\n' "${email:0:26}" \
         "$([ "${totalgb:-0}" -gt 0 ] 2>/dev/null && human_bytes "$totalgb" || echo "∞")" \
@@ -3336,15 +3097,49 @@ EOF
   return 0
 }
 
+# Единый порядок для отображения и выбора: только подходящие REALITY-кандидаты.
+# Полный TSV при этом остаётся на диске для технической диагностики.
+reality_scan_candidates() { # $1 tsv
+  awk -F '\t' '$9 == "ДА" || $9 == "ДА+"' "$1" | sort -t$'\t' -k9,9r -k1,1V
+}
+
+reality_scan_candidate_row() { # $1 tsv, $2 номер из нумерованной таблицы
+  [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 1
+  reality_scan_candidates "$1" | sed -n "${2}p"
+}
+
 reality_scan_print() { # $1 tsv
+  local total; total="$(reality_scan_candidates "$1" | wc -l)"
+  if [ "$total" -eq 0 ]; then
+    echo ""
+    warn "Подходящих REALITY-кандидатов не найдено."
+    return 1
+  fi
   echo ""
-  printf '%-16s %-5s %-3s %-7s %-6s %-28s %-30s %s\n' "IP" "TLS13" "H2" "X25519" "SELF" "CN" "SNI(SAN)" "ГОДЕН"
-  echo "----------------------------------------------------------------------------------------------------------"
-  sort -t$'\t' -k9,9r -k1,1V "$1" | while IFS=$'\t' read -r ip t13 h2 x2 ss cn san end v; do
-    printf '%-16s %-5s %-3s %-7s %-6s %-28s %-30s %s\n' "$ip" "$t13" "$h2" "$x2" "$ss" "${cn:0:28}" "${san:0:30}" "$v"
-  done
+  printf '%-5s %-16s %-3s %-7s %-34s %s\n' "№" "IP" "H2" "X25519" "SNI(SAN)" "ГОДЕН"
+  echo "--------------------------------------------------------------------------------"
+  local n=0 ip t13 h2 x2 ss cn san end v
+  while IFS=$'\t' read -r ip t13 h2 x2 ss cn san end v; do
+    n=$((n+1))
+    printf '%-5s %-16s %-3s %-7s %-34s %s\n' "$n" "$ip" "$h2" "$x2" "${san:0:34}" "$v"
+  done < <(reality_scan_candidates "$1")
   echo ""
-  ok "Годен = TLS1.3 + публичный сертификат (не self-signed). «ДА+» = ещё и H2/X25519 (лучший камуфляж)."
+  ok "Показаны только подходящие: TLS1.3 + публичный сертификат. «ДА+» = ещё и H2/X25519."
+}
+
+# Общий выбор по номеру для мастера на сервере и сканирования с ноды.
+reality_scan_choose() { # $1 tsv; результат в RDEST / RSNI
+  local out="$1" n row
+  reality_scan_print "$out" || return 1
+  ok "Полный технический отчёт сохранён: $out"
+  read -r -p "Номер кандидата из таблицы (Enter — отмена): " n || return 1
+  [ -n "$n" ] || return 1
+  row="$(reality_scan_candidate_row "$out" "$n")"
+  [ -n "$row" ] || { err "Нет кандидата с таким номером"; return 1; }
+  RDEST="$(awk -F'\t' '{print $1":443"}' <<<"$row")"
+  RSNI="$(awk -F'\t' '{print ($7!="-" && $7!="") ? $7 : $6}' <<<"$row")"
+  [ -n "$RSNI" ] && [ "$RSNI" != "-" ] || { err "У кандидата нет домена в сертификате — SNI не определить"; return 1; }
+  return 0
 }
 
 # выбор из готового списка; результат в RDEST / RSNI
@@ -3368,7 +3163,7 @@ reality_known_pick() {
 
 # скан подсети + выбор кандидата; результат в RDEST / RSNI
 reality_scan_pick() {
-  local myip def t targets n row
+  local myip def t targets
   myip="$(pubip)"
   def=""; [ -n "$myip" ] && def=" (Enter = ${myip%.*}.0/24 — подсеть этого сервера)"
   read -r -p "Что сканируем? CIDR или список IP/доменов через пробел${def} -> " t
@@ -3379,16 +3174,7 @@ reality_scan_pick() {
   mkdir -p "$XKIT_DIR"
   reality_scan_run "$targets" "$out" || return 1
   [ -s "$out" ] || { warn "Ни один адрес не ответил на :443"; return 1; }
-  reality_scan_print "$out"
-  ok "Результат сохранён: $out"
-  read -r -p "Номер dest из таблицы (Enter — отмена): " n
-  [ -n "$n" ] || return 1
-  row="$(sort -t$'\t' -k9,9r -k1,1V "$out" | sed -n "${n}p")"
-  [ -n "$row" ] || { err "Нет такого номера"; return 1; }
-  RDEST="$(awk -F'\t' '{print $1":443"}' <<<"$row")"
-  RSNI="$(awk -F'\t' '{print ($7!="-" && $7!="") ? $7 : $6}' <<<"$row")"
-  [ -n "$RSNI" ] && [ "$RSNI" != "-" ] || { err "У кандидата нет домена в сертификате — SNI не определить"; return 1; }
-  return 0
+  reality_scan_choose "$out"
 }
 
 # $1 dest (host:port | ip:port | 127.0.0.1:8444), $2 sni
@@ -3515,8 +3301,7 @@ reality_scan_menu() {
   case "$targets" in ERR:*) err "$targets"; return 1 ;; esac
   reality_scan_run "$targets" "$out" || return 1
   [ -s "$out" ] || { warn "Никто не ответил на :443"; return 0; }
-  reality_scan_print "$out"
-  ok "Результат сохранён: $out"
+  reality_scan_print "$out" || warn "Полный отчёт сохранён для диагностики: $out"
   return 0
 }
 
@@ -3742,7 +3527,9 @@ tpl = json.loads(sys.argv[1]) if sys.argv[1].strip() else {}
 src = sys.argv[2]
 # V-03: прод передаёт ПУТЬ к файлу (секреты не в argv); тесты — само содержимое
 if os.path.isfile(src):
-    nodes = json.load(open(src))
+    # (мелочь №5, аудит v5.2.1): явные with/encoding вместо голого open()
+    with open(src, encoding="utf-8") as fh:
+        nodes = json.load(fh)
 else:
     nodes = json.loads(src)
 pool_tag = sys.argv[3]
@@ -3838,7 +3625,7 @@ nodes_apply_template() {
 
 # скан подсети С САМОЙ НОДЫ (кандидаты видны из её сети/гео); результат в RDEST / RSNI
 node_reality_scan_pick() { # $1 rec ноды
-  local rec="$1" t tlist n row
+  local rec="$1" t tlist
   local out="${XKIT_DIR}/reality-scan-node.tsv"
   mkdir -p "$XKIT_DIR" 2>/dev/null || true
   read -r -p "Что сканируем С НОДЫ? CIDR/список через пробел (Enter = /24 самой ноды) -> " t
@@ -3895,16 +3682,7 @@ rm -f "$TMP" "$OPEN"
 EOS
   [ -s "$out" ] || { warn "Нода: ни один адрес не ответил на :443 (или SSH-сессия оборвалась)"; return 1; }
   grep -q '^ERR:' "$out" && { err "$(head -n1 "$out")"; return 1; }
-  reality_scan_print "$out"
-  ok "Результат сохранён: $out"
-  read -r -p "Номер dest из таблицы (Enter — отмена): " n
-  [ -n "$n" ] || return 1
-  row="$(sort -t$'\t' -k9,9r -k1,1V "$out" | sed -n "${n}p")"
-  [ -n "$row" ] || { err "Нет такого номера"; return 1; }
-  RDEST="$(awk -F'\t' '{print $1":443"}' <<<"$row")"
-  RSNI="$(awk -F'\t' '{print ($7!="-" && $7!="") ? $7 : $6}' <<<"$row")"
-  [ -n "$RSNI" ] && [ "$RSNI" != "-" ] || { err "У кандидата нет домена в сертификате — SNI не определить"; return 1; }
-  return 0
+  reality_scan_choose "$out"
 }
 
 node_add() {
@@ -3970,6 +3748,12 @@ node_add() {
     | ssh-keygen -lf - 2>/dev/null | head -n1 | awk '{print $2, $4}')"
   [ -n "$fp" ] && ok "Ключ хоста ноды зафиксирован (TOFU; можно сверить с консолью провайдера): ${fp}"
 
+  # (з.6, аудит v5.2.1): официальный установщик на ноде тоже бежит от root —
+  # спрашиваем явно, если 3X-UI там ещё нет (XKIT_YES — для автоматизации)
+  if ! node_ssh "$rec" "command -v x-ui >/dev/null 2>&1" >/dev/null 2>&1; then
+    confirm "Скачать и запустить официальный установщик 3X-UI на ноде (от root)? [Y/n] " y \
+      || { warn "Установка 3X-UI на ноде отменена"; return 1; }
+  fi
   log "Устанавливаю 3X-UI на ноду (если его нет)..."
   # K-02: тот же тег-релиз, что и на мастере; URL валидирован в xui_install_url
   local xuiu; xuiu="$(xui_install_url)"
@@ -4046,7 +3830,8 @@ EOS
   else
     tport=443
   fi
-  read -r -p "Порт туннеля на ноде [${tport}]: " tp; tp="${tp:-$tport}"; is_port "$tp" || { err "Порт"; return 1; }
+  # (з.9, аудит v5.2.1): EOF/Ctrl-D отменяет ввод, как у соседних полей, а не молча ставит дефолт
+  read -r -p "Порт туннеля на ноде [${tport}]: " tp || { echo; return 1; }; tp="${tp:-$tport}"; is_port "$tp" || { err "Порт"; return 1; }
 
   echo "Dest (прикрытие) для Reality на ноде:"
   echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) СКАН С САМОЙ НОДЫ"
@@ -4319,7 +4104,11 @@ nodes_health() {
       fails=$((fails+1))
       continue
     fi
-    if node_ssh "$rec" "systemctl is-active x-ui" >/dev/null 2>&1; then
+    # (баг №3, аудит v5.2.1): systemctl is-active возвращает 3 для inactive — это
+    # НЕ провал SSH. Разделяем: «active» / SSH-провал (255, timeout 124) / x-ui не активен
+    local svc_out rc
+    svc_out="$(node_ssh "$rec" "systemctl is-active x-ui" 2>/dev/null)"; rc=$?
+    if [ "$svc_out" = "active" ]; then
       ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)"
       if node_login "$rec" "$ck"; then
         echo "  [OK]   ${name}: туннель :${tport}, x-ui работает, панель отвечает"
@@ -4328,9 +4117,12 @@ nodes_health() {
         fails=$((fails+1))
       fi
       rm -f "$ck"
-    else
+    elif [ "$rc" -eq 255 ] || [ "$rc" -eq 124 ]; then
       echo "  [ВНИМ] ${name}: туннель жив, SSH до ноды не прошёл (x-ui проверьте руками)"
       ssh_fails=$((ssh_fails+1))
+    else
+      echo "  [ВНИМ] ${name}: туннель жив, x-ui не активен (systemctl: ${svc_out:-код $rc})"
+      fails=$((fails+1))
     fi
   done < <(jq -c '.[]' <<<"$arr")
   if [ "$fails" -gt 0 ]; then
@@ -4798,10 +4590,35 @@ dash_master_json() {
      uptime_days:(if $up=="" then null else ($up|tonumber) end)}'
 }
 
-# статистика одной ноды (туннель + панель + трафик) -> JSON-объект в одну строку
+# Системные CPU/RAM ноды через существующий защищённый SSH; агент не нужен.
+# Значения неизвестны => null, а не фиктивный ноль. Команда на ноде фиксированная.
+node_resource_stats() { # $1 rec-ноды
+  local out cpu ram load
+  out="$(node_ssh "$1" 'bash -s' 2>/dev/null <<'EOS'
+cpu_sample() { awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t,$5+$6; exit}' /proc/stat; }
+read -r t0 i0 < <(cpu_sample)
+sleep 1
+read -r t1 i1 < <(cpu_sample)
+cpu="$(awk -v t0="$t0" -v i0="$i0" -v t1="$t1" -v i1="$i1" 'BEGIN{dt=t1-t0; di=i1-i0; if(dt>0)printf "%.1f",100*(dt-di)/dt; else print "0"}')"
+mem="$(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)printf "%.1f",100*(t-a)/t;else print "0"}' /proc/meminfo)"
+load="$(awk '{print $1}' /proc/loadavg)"
+printf '%s\t%s\t%s\n' "$cpu" "$mem" "$load"
+EOS
+)"
+  if [[ "$out" =~ ^[0-9]+([.][0-9]+)?[[:space:]]+[0-9]+([.][0-9]+)?[[:space:]]+[0-9]+([.][0-9]+)?$ ]]; then
+    IFS=$'\t' read -r cpu ram load <<<"$out"
+    jq -nc --argjson c "$cpu" --argjson r "$ram" --argjson l "$load" \
+      '{resources:"ok",cpu_pct:$c,ram_pct:$r,load1:$l}'
+  else
+    jq -nc '{resources:"unavailable",cpu_pct:null,ram_pct:null,load1:null}'
+  fi
+}
+
+# статистика одной ноды (туннель + панель + трафик + системные ресурсы)
 dash_node_stats() { # $1 rec-ноды, $2 expiry-дата (или пусто), $3 заметка
   local rec="$1" exp="${2:-}" note="${3:-}"
   local name host tport status="down" lat="" panel="n/a" up=0 down=0 total=0 clients=0
+  local resources='{"resources":"unavailable","cpu_pct":null,"ram_pct":null,"load1":null}'
   local t0 t1
   name="$(jq -r '.name' <<<"$rec")"
   host="$(jq -r '.host' <<<"$rec")"
@@ -4838,9 +4655,10 @@ dash_node_stats() { # $1 rec-ноды, $2 expiry-дата (или пусто), $
     fi
     rm -f "$ck"
   fi
-  local dl
+  [ "$status" = "ok" ] && resources="$(node_resource_stats "$rec")"
+  local dl base
   dl="$(days_left "$exp")"
-  jq -nc --arg n "$name" --arg h "$host" --arg st "$status" \
+  base="$(jq -nc --arg n "$name" --arg h "$host" --arg st "$status" \
      --argjson tp "$tport" --argjson lat "${lat:-null}" --arg p "$panel" \
      --argjson up "${up:-0}" --argjson down "${down:-0}" \
      --argjson tot "${total:-0}" --argjson cl "${clients:-0}" \
@@ -4849,7 +4667,52 @@ dash_node_stats() { # $1 rec-ноды, $2 expiry-дата (или пусто), $
      up:$up, down:$down, total:$tot, clients:$cl,
      expiry:(if $exp=="" then null else $exp end),
      days_left:$dl,
-     note:(if $note=="" then null else $note end)}'
+     note:(if $note=="" then null else $note end)}')"
+  # (аудит v5.2.1, дух W-6): ресурсы от ноды обязаны быть JSON-объектом —
+  # мусор/TSV от SSH не должен ломать весь jq-конвейер статистики ноды
+  jq -e 'type=="object"' <<<"$resources" >/dev/null 2>&1 \
+    || resources='{"resources":"unavailable","cpu_pct":null,"ram_pct":null,"load1":null}'
+  jq -c --argjson r "$resources" '. + $r' <<<"$base"
+}
+
+# Общий кэш нод для веб-дашборда и TUI. Активность = дельта счётчиков за
+# прошедший интервал, а не накопленный total. При сбросе счётчика rate=null.
+nodes_metrics_collect() {
+  local arr rec nname cur prev previous='{}' now dt
+  local -a recs=()
+  now="$(date +%s)"
+  if [ -r "$XKIT_NODES_METRICS" ] && jq -e 'type=="object"' "$XKIT_NODES_METRICS" >/dev/null 2>&1; then
+    previous="$(cat "$XKIT_NODES_METRICS")"
+  fi
+  dt=$((now-$(jq -r '.generated // 0' <<<"$previous" 2>/dev/null || echo 0)))
+  arr="$(nodes_load)"
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    nname="$(jq -r '.name' <<<"$rec")"
+    cur="$(dash_node_stats "$rec" "$(expiry_get node "$nname")" "$(expiry_note node "$nname")")"
+    prev="$(jq -c --arg n "$nname" '[.nodes[]?|select(.name==$n)][0] // {}' <<<"$previous")"
+    cur="$(jq -c --argjson p "$prev" --argjson dt "$dt" '
+      . as $c | ($p.total // null) as $old |
+      if ($old|type)=="number" and $dt>0 and $c.total>=$old then
+        .interval_total=($c.total-$old) |
+        .interval_up=($c.up-($p.up//0)) |
+        .interval_down=($c.down-($p.down//0)) |
+        .rate_bps=(($c.total-$old)/$dt)
+      else
+        .interval_total=null | .interval_up=null | .interval_down=null | .rate_bps=null
+      end' <<<"$cur")"
+    recs+=("$cur")
+  done < <(jq -c '.[]' <<<"$arr")
+  local nodes_json='[]' data tmp
+  [ "${#recs[@]}" -eq 0 ] || nodes_json="$(printf '%s\n' "${recs[@]}" | jq -s '.' 2>/dev/null || echo '[]')"
+  data="$(jq -nc --argjson gen "$now" --argjson nodes "$nodes_json" \
+    '{generated:$gen,generated_str:($gen|todate),nodes:$nodes}')" || return 1
+  mkdir -p "$(dirname "$XKIT_NODES_METRICS")" || return 1
+  tmp="$(mktemp "${XKIT_NODES_METRICS}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$data" >"$tmp" || ! chmod 640 "$tmp" || ! mv -f "$tmp" "$XKIT_NODES_METRICS"; then
+    rm -f "$tmp"; return 1
+  fi
+  printf '%s\n' "$data"
 }
 
 # санитизированные данные для data.json: БЕЗ privateKey Reality, UUID/subId
@@ -5030,18 +4893,9 @@ dash_gen_locked() {
   local master_json
   master_json="$(dash_master_json)"
 
-  # --- ноды: статус туннеля, латентность, панель ноды, трафик, срок аренды ---
-  local nodes_json="[]" arr rec nname
-  local -a recs=()
-  arr="$(nodes_load)"
-  if [ "$(jq 'length' <<<"${arr:-[]}" 2>/dev/null || echo 0)" -gt 0 ]; then
-    while IFS= read -r rec; do
-      [ -z "$rec" ] && continue
-      nname="$(jq -r '.name' <<<"$rec")"
-      recs+=( "$(dash_node_stats "$rec" "$(expiry_get node "$nname")" "$(expiry_note node "$nname")")" )
-    done < <(jq -c '.[]' <<<"$arr")
-    [ "${#recs[@]}" -gt 0 ] && nodes_json="$(printf '%s\n' "${recs[@]}" | jq -s '.' 2>/dev/null || echo '[]')"
-  fi
+  # --- общий сборщик: туннель/API/трафик/CPU/RAM; тот же кэш читает TUI ---
+  local nodes_json="[]"
+  nodes_json="$(nodes_metrics_collect | jq -c '.nodes')" || return 1
 
   # --- аренда мастер-сервера ---
   local mexp expiry_json="null" mdl
@@ -5419,7 +5273,10 @@ dash_rotate() {
   # бэкап htpasswd: откат — КОПИРОВАНИЕМ, а не пересчётом openssl (аудит №6:
   # пересчёт мог упасть и оставить новый пароль в htpasswd при старом env)
   local htbk; htbk="$(mktemp /tmp/.xkit-htbk.XXXXXX 2>/dev/null)" || htbk=""
-  if [ -n "$htbk" ]; then cp -f "$XKIT_DASH_HTPASSWD" "$htbk" 2>/dev/null || htbk=""; fi
+  if [ -n "$htbk" ]; then
+    # (мелочь №4, аудит v5.2.1): cp не удался — подчищаем созданный mktemp-файл
+    if cp -f "$XKIT_DASH_HTPASSWD" "$htbk" 2>/dev/null; then :; else rm -f "$htbk"; htbk=""; fi
+  fi
   if [ -z "$htbk" ]; then
     # №4 (аудит №1): без бэкапа откат невозможен — рассинхрон «nginx требует
     # новый пароль, env — старый». Честно отменяем ДО генерации новых значений
@@ -6235,17 +6092,26 @@ xkit_tui_run() {
 xkit_snapshot() { # только агрегаты; без UUID, privateKey, паролей и токенов
   load_xkit_env >/dev/null 2>&1 || true
   local host="${XKIT_HOST:-}" mode=solo nodes=0 nodes_ok=0 clients=0 cert_days=-1 backup_hours=-1
-  local nginx=false xui=false xray=false protocols='[]' inbounds=''
+  local nginx=false xui=false xray=false protocols='[]' inbounds='' nodes_metrics='[]' metrics_generated=0
   systemctl is-active --quiet nginx 2>/dev/null && nginx=true
   systemctl is-active --quiet x-ui 2>/dev/null && xui=true
   pgrep -x xray >/dev/null 2>&1 && xray=true
   if [ -r "$XKIT_NODES" ]; then nodes="$(jq 'length' "$XKIT_NODES" 2>/dev/null || echo 0)"; fi
   [[ "$nodes" =~ ^[0-9]+$ ]] || nodes=0
   [ "$nodes" -gt 0 ] && mode=master
-  if [ -r "${XKIT_DASH_DIR}/data.json" ]; then
+  if [ -r "$XKIT_NODES_METRICS" ]; then
+    # Явный whitelist: host, заметки, реквизиты панели и любые новые поля кэша
+    # автоматически в snapshot не попадают.
+    # (з.8, аудит v5.2.1): interval_up/interval_down в whitelist — иначе TUI не может
+    # показать «↑/↓ за интервал» отдельно от общего
+    nodes_metrics="$(jq -c '[.nodes[]?|{name,status,panel,latency_ms,cpu_pct,ram_pct,load1,total,clients,resources,rate_bps,interval_total,interval_up,interval_down}]' "$XKIT_NODES_METRICS" 2>/dev/null || echo '[]')"
+    metrics_generated="$(jq -r '.generated // 0' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
+    nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
+  elif [ -r "${XKIT_DASH_DIR}/data.json" ]; then
     nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "${XKIT_DASH_DIR}/data.json" 2>/dev/null || echo 0)"
   fi
   [[ "$nodes_ok" =~ ^[0-9]+$ ]] || nodes_ok=0
+  [[ "$metrics_generated" =~ ^[0-9]+$ ]] || metrics_generated=0
   if [ -r "${XKIT_CRT:-}" ]; then
     local end_epoch now_epoch
     end_epoch="$(date -d "$(openssl x509 -in "$XKIT_CRT" -noout -enddate 2>/dev/null | cut -d= -f2-)" +%s 2>/dev/null || echo 0)"
@@ -6265,7 +6131,8 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
     --argjson nodes "$nodes" --argjson nodes_ok "$nodes_ok" --argjson clients "$clients" \
     --argjson nginx "$nginx" --argjson xui "$xui" --argjson xray "$xray" \
     --argjson cert_days "$cert_days" --argjson backup_hours "$backup_hours" --argjson protocols "$protocols" \
-    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,generated:$generated}'
+    --argjson nodes_metrics "$nodes_metrics" --argjson metrics_generated "$metrics_generated" \
+    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
 }
 
 usage() {
@@ -6290,6 +6157,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes            — меню нод (добавить/список/health/стратегия/удалить)
   xkit nodes repair     — переприменить конфигурацию нод (после сбоя apply)
   xkit nodes repin [имя|all] — перепинить сертификат панели ноды (MITM-защита)
+  xkit nodes metrics    — обновить трафик, скорость, ping и системные CPU/RAM нод
   xkit extfix           — externalProxy + подписки панели (корректные ссылки в UI)
   xkit health          — проверка жизнеспособности
   xkit backup          — бэкап сейчас (БД панели + конфиг + серты + подписки)
@@ -6343,6 +6211,7 @@ main() {
              case "${1:-menu}" in
                repair) nodes_repair ;;
                repin)  shift; node_repin "${1:-all}" ;;
+               metrics) nodes_metrics_collect >/dev/null && ok "Метрики нод обновлены: $XKIT_NODES_METRICS" ;;
                *) nodes_menu ;;
              esac ;;
     extfix)  require_root; external_proxy_fix ;;

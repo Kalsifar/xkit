@@ -370,6 +370,16 @@ install_cert_files() {
     err "Не найдены $src/fullchain.pem и/или $src/privkey.pem"
     return 1
   fi
+  # (з.7/з.11, аудит v5.2.1): парность ключа (как в xkit.sh) + непустой вывод
+  # openssl — иначе «пусто == пусто» на битых файлах проходило как пара
+  local _pk1 _pk2
+  _pk1="$(openssl x509 -noout -pubkey -in "$src/fullchain.pem" 2>/dev/null)" \
+    || { err "fullchain.pem не читается как сертификат (openssl)"; return 1; }
+  _pk2="$(openssl pkey -pubout -in "$src/privkey.pem" 2>/dev/null)" \
+    || { err "privkey.pem не читается как приватный ключ (openssl)"; return 1; }
+  [ -n "$_pk1" ] && [ -n "$_pk2" ] \
+    && [ "$(sha256sum <<<"$_pk1" | awk '{print $1}')" = "$(sha256sum <<<"$_pk2" | awk '{print $1}')" ] \
+    || { err "fullchain.pem и privkey.pem не парные (разные или битые ключи)"; return 1; }
   mkdir -p "$dest"
   cp "$src/fullchain.pem" "$dest/fullchain.pem"
   cp "$src/privkey.pem"  "$dest/privkey.pem"

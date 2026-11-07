@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v5.2.0
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v5.3.1
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды, дашборд) не раздувается, а правки меню не трогают xkit.sh.
@@ -146,7 +146,8 @@ menu_service_cert() { # бывший пункт 10 главного меню: п
   choose_certificate "$XKIT_HOST" "$(host_kind "$XKIT_HOST")" || return 1
   XKIT_CRT="$FINAL_CRT"; XKIT_KEY="$FINAL_KEY"; XKIT_CERT_MODE="$CERT_MODE"
   save_xkit_env
-  regen_conf_and_apply
+  # (мелочь №10, аудит v5.2.1): сбой применения не должен прятаться за общим сообщением
+  regen_conf_and_apply || { err "Конфиг nginx не применён — проверьте: nginx -t"; return 1; }
   warn "Клиентам могут понадобиться новые файлы серта (для IP-сертов — обновите подписку)"
 }
 
